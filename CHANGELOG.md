@@ -11,7 +11,7 @@ verified on real hardware is marked as such.
 
 ### On-screen display (not wired into the daemon yet)
 - `display/`: a small Java program that draws the phone's status on the screen through SurfaceFlinger while the UI is off, run by hand with `display/run.sh`. It has a tiny framework (pages, a data bus that also reads extra JSON files, themes, a drawing toolkit) and one page, a letterpress-style status ticket, in a paper theme and an OLED-friendly night theme. `scripts/pc/get-display-tools.sh` downloads the JDK, d8 and android.jar it is built with (about 260 MB, into `~/.local/droidkibble-sdk`). See `display/README.md`.
-- Checked on the Galaxy A30: it shows on the physical panel (I saw it on the screen) and in `screencap`, both themes render, and it uses about 100 MB of RAM. Not checked: battery cost, running for hours, other phones.
+- Checked on the Galaxy A30: the first prototype was seen on the physical panel, and the ticket page is confirmed in `screencap` screenshots of SurfaceFlinger's output in both themes. It uses about 100 MB of RAM. Not checked: the ticket page's look on the physical panel, battery cost, running for hours, other phones.
 
 ### Fixed
 - `scripts/phone/diagnose.sh` took minutes with the UI running (it started a `readlink` for every file descriptor of every process). It now uses one `ls` and takes about 2 seconds. I only found this by running it with the normal UI up; the headless run had been fast.

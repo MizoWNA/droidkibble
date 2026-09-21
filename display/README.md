@@ -10,7 +10,7 @@ The look is a letterpress ticket: a ruled grid on the body, a perforation, and a
 
 ## Status
 
-Checked on the Galaxy A30: it starts, the layer shows up in a `screencap` of SurfaceFlinger's output and on the physical panel, both themes render, and it redraws every few seconds. It uses about 100 MB of RAM while running.
+Checked on the Galaxy A30: it starts, both themes render correctly in a `screencap` of SurfaceFlinger's output, and it redraws every few seconds. An earlier plain-text version of the same approach was seen on the physical panel; the ticket page itself hasn't been looked at on the panel yet. It uses about 100 MB of RAM while running.
 
 Not done yet: `phoneserverd` doesn't start or stop it, so for now you run it by hand (below). I haven't measured its battery cost or run it for hours, and the panel brightness is fixed by `run.sh`.
 
