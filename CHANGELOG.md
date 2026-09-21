@@ -6,6 +6,7 @@ verified on real hardware is marked as such.
 ## 0.1.0 (first public version)
 
 ### Added
+- kibble can now find the phone on any network (by its SSH host key), with a scan-and-login screen when it can't (`kibble`, `:connect`), `kibble learn/find/connect`, and `kibble ssh-config --install` so plain `ssh`, `scp` and `phonessh` follow the phone. Also: Tab switches between the Android shell and the chroot, real cursor editing, `clear`/Ctrl-L, F5/F6 to switch headless on/off (now and at boot), and the watchdog age now counts up between updates instead of always reading 0. Password login is written but untested. Details in `docs/companion.md`.
 - `scripts/pc/kibble`: an arcade-style terminal dashboard (Python, standard library only). A pixel dog in the middle shows whether the watchdog is being fed, with battery and memory on its left and network, DHCP and watchdog on its right. The bottom third is a persistent shell on the phone (Android shell, or `@arch` for the chroot, each keeping its own directory). See `docs/companion.md`. Tested on Linux against the Galaxy A30 in headless mode through a pseudo-terminal; the look on real terminals, the other dog moods, and macOS are untested.
 - Project name is now droidkibble (was the working title phone-server). The on-phone paths (`/data/adb/phoneserver/`) are unchanged.
 - Issue templates in `.github/ISSUE_TEMPLATE/`: a device report and a bug form, both asking for `diagnose.sh` output.

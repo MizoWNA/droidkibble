@@ -3,27 +3,43 @@
 
 A pixel dog in the middle tells you whether the watchdog is being fed. Battery and memory
 are on its left, network, DHCP and watchdog details on its right, and the bottom third is a
-shell on the phone.
+shell on the phone. It also switches headless mode on and off.
 
-It only wraps ssh (key login, nothing stored). Python 3 standard library only. Wants a
-terminal with 256 colors and about 100x30; on less it falls back to a small ASCII dog.
+It only wraps ssh. Python 3 standard library only. Wants a terminal with 256 colors and about
+100x30; on less it falls back to a small ASCII dog.
 
-    kibble <ssh-host>            dashboard (an ssh host that logs in as root on the phone)
+    kibble [ssh-host]            the dashboard. With no host it finds the phone by itself, and if it
+                                 can't it offers to scan your network and helps you log in.
     kibble <ssh-host> --once     print one snapshot as text and exit (also handy in scripts)
 
-Bottom shell (it is a real session, so cd and variables stick):
-    <text> + Enter   run in the phone's Android root shell
-    @arch <text>     run in the Arch chroot session instead (it has its own directory)
+    kibble find                  print the phone's current address (looks for it if it moved)
+    kibble learn <ssh-host>      remember this phone (its address and SSH host key) for finding it later
+    kibble connect [port]        an ssh ProxyCommand that follows the phone between networks
+    kibble ssh-config [--install|--remove]   set that up for `phone-root` and `arch` in ~/.ssh/config
+
+Keys in the dashboard:
+    Enter            run the line in the current shell (Android root shell or the Arch chroot)
+    Tab or Ctrl-T    switch between the two shells (each keeps its own directory)
+    Left/Right/Home/End/Delete, Ctrl-A/E/W/K/U   edit the line
     Up / Down        command history          PgUp / PgDn   scroll the output
-    Ctrl-U           clear the line           :q or Ctrl-D  quit
-    Ctrl-C           stop a running command (drops that shell session), or quit when idle
+    Ctrl-L or `clear`  clear the output
+    F5  or :headless   turn headless mode on/off right now (asks first)
+    F6  or :boot       turn "go headless at boot" on/off (asks first)
+    :connect           pick a different phone / log in again        :help   list these
+    :q or Ctrl-D       quit                     Ctrl-C   stop a running command, or quit when idle
 Programs that need a terminal (top, vim, ...) don't work here; use ssh for those.
 """
 import argparse
 import collections
+import concurrent.futures
 import curses
+import ipaddress
 import json
 import os
+import re
+import select
+import shlex
+import socket
 import subprocess
 import sys
 import threading
@@ -40,23 +56,258 @@ DONE = "__KB_DONE__"
 FED_OK_S = 15          # the daemon feeds every 5 s; slower than this looks wrong
 STALE_S = 20           # status.json older than this is not from a running daemon
 CMD_TIMEOUT_S = 120
+CONF = os.path.expanduser("~/.config/droidkibble/phone.json")
+CACHE = os.path.expanduser("~/.cache/droidkibble")
+SSH_CONFIG = os.path.expanduser("~/.ssh/config")
+MARK_A, MARK_B = "# >>> droidkibble (managed by `kibble ssh-config`)", "# <<< droidkibble"
 
 
-# ---------------------------------------------------------------- talking to the phone
+# ---------------------------------------------------------------- how to reach the phone
 
-def ssh_argv(host, remote, timeout=None):
-    cache = os.path.expanduser("~/.cache/droidkibble")
-    os.makedirs(cache, exist_ok=True)
-    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5",
-            "-o", "ControlMaster=auto", "-o", "ControlPersist=120",
-            "-o", f"ControlPath={cache}/cm-%C", host, remote]
+class Target:
+    """How ssh reaches and logs in to the phone."""
+
+    def __init__(self, host="", opts=None, env=None):
+        self.host, self.env = host, env or {}
+        self.opts = opts if opts is not None else ["-o", "BatchMode=yes"]
+
+
+TARGET = Target()
+
+
+def ssh_argv(remote, timeout=None, target=None):
+    t = target or TARGET
+    os.makedirs(CACHE, exist_ok=True)
+    argv = ["ssh", "-o", "ConnectTimeout=8", "-o", "ServerAliveInterval=5", "-o", "ControlMaster=auto",
+            "-o", "ControlPersist=120", "-o", f"ControlPath={CACHE}/cm-%C", *t.opts, t.host, remote]
     return ["timeout", str(timeout)] + argv if timeout else argv
 
 
-def fetch(host):
+def child_env(target=None):
+    e = os.environ.copy()
+    e.update((target or TARGET).env)
+    return e
+
+
+def key_target(ip, user, key):
+    opts = ["-o", "BatchMode=yes", "-o", "StrictHostKeyChecking=accept-new"]
+    if key:
+        opts += ["-i", key, "-o", "IdentitiesOnly=yes"]
+    return Target(f"{user}@{ip}", opts)
+
+
+def password_target(ip, user, password):
+    """ssh has no password flag; SSH_ASKPASS with a tiny helper hands it over. Kept in memory only."""
+    os.makedirs(CACHE, exist_ok=True)
+    helper = os.path.join(CACHE, "askpass.sh")
+    with open(helper, "w") as f:
+        f.write('#!/bin/sh\nprintf "%s\\n" "$KIBBLE_PW"\n')
+    os.chmod(helper, 0o700)
+    opts = ["-o", "BatchMode=no", "-o", "PubkeyAuthentication=no", "-o", "NumberOfPasswordPrompts=1",
+            "-o", "PreferredAuthentications=password,keyboard-interactive",
+            "-o", "StrictHostKeyChecking=accept-new"]
+    env = {"SSH_ASKPASS": helper, "SSH_ASKPASS_REQUIRE": "force", "KIBBLE_PW": password,
+           "DISPLAY": os.environ.get("DISPLAY", ":0")}
+    return Target(f"{user}@{ip}", opts, env)
+
+
+def works(target, timeout=15):
+    try:
+        p = subprocess.run(ssh_argv("true", 12, target), capture_output=True, text=True, timeout=timeout,
+                           env=child_env(target), stdin=subprocess.DEVNULL)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return False, str(e)
+    if p.returncode == 0:
+        return True, ""
+    err = [l for l in p.stderr.splitlines() if l and not l.startswith(("**", "Warning"))]
+    return False, (err[-1] if err else f"ssh exited {p.returncode}")
+
+
+# ---------------------------------------------------------------- finding the phone on any network
+# The phone is recognised by its SSH host key, not its address, so it can be found again after
+# moving to another network. The scan only looks at this computer's own subnets, on port 22, and
+# reads host keys. It never tries to log in to anything.
+
+def load_conf():
+    try:
+        with open(CONF) as f:
+            return json.load(f)
+    except (OSError, ValueError):
+        return {}
+
+
+def save_conf(**kv):
+    conf = load_conf()
+    conf.update(kv)
+    os.makedirs(os.path.dirname(CONF), exist_ok=True)
+    with open(CONF, "w") as f:
+        json.dump(conf, f, indent=1)
+
+
+def port_open(ip, port, timeout=0.6):
+    try:
+        socket.create_connection((ip, port), timeout).close()
+        return True
+    except OSError:
+        return False
+
+
+def keyscan(ip, port=22, timeout=3):
+    """Host keys as 'type base64' strings; [] if nothing answers."""
+    try:
+        p = subprocess.run(["ssh-keyscan", "-T", str(timeout), "-p", str(port), ip],
+                           capture_output=True, text=True, timeout=timeout + 3)
+    except (subprocess.TimeoutExpired, OSError):
+        return []
+    return [f"{f[1]} {f[2]}" for f in (l.split() for l in p.stdout.splitlines() if not l.startswith("#"))
+            if len(f) >= 3]
+
+
+def local_subnets():
+    try:
+        out = subprocess.run(["ip", "-4", "-o", "addr", "show", "scope", "global"],
+                             capture_output=True, text=True).stdout
+    except OSError:
+        return []
+    nets = []
+    for line in out.splitlines():
+        parts = line.split()
+        if len(parts) > 3:
+            i = ipaddress.ip_interface(parts[3])
+            net = i.network if i.network.prefixlen >= 22 else ipaddress.ip_network(f"{i.ip}/22", strict=False)
+            nets.append((net, str(i.ip)))
+    return nets
+
+
+def scan(on_status=None):
+    """Hosts with ssh open on this computer's subnets: [{'ip', 'keys'}], the known phone first."""
+    hosts = []
+    for net, me in local_subnets():
+        if on_status:
+            on_status(f"scanning {net}")
+        hosts += [str(h) for h in net.hosts() if str(h) != me]
+    with concurrent.futures.ThreadPoolExecutor(64) as ex:
+        opens = [ip for ip, ok in zip(hosts, ex.map(lambda ip: port_open(ip, 22), hosts)) if ok]
+    if on_status:
+        on_status(f"reading host keys of {len(opens)} host(s)")
+    with concurrent.futures.ThreadPoolExecutor(8) as ex:
+        found = [{"ip": ip, "keys": k} for ip, k in zip(opens, ex.map(keyscan, opens))]
+    known = set(load_conf().get("hostkeys", []))
+    for f in found:
+        f["phone"] = bool(known & set(f["keys"]))
+    return sorted(found, key=lambda f: (not f["phone"], f["ip"]))
+
+
+def resolve_phone(port=22, log=None):
+    """The phone's current address, or None. Tries the last known one first, then scans."""
+    conf = load_conf()
+    keys, ip = set(conf.get("hostkeys", [])), conf.get("ip")
+    if not keys:
+        return None
+    if ip and port_open(ip, port, 1.5):
+        if time.time() - conf.get("verified_at", 0) < 60 or keys & set(keyscan(ip)):
+            save_conf(verified_at=time.time())
+            return ip
+    if log:
+        log("kibble: the phone isn't at its last address, looking for it on this network...")
+    for f in scan():
+        if f["phone"] and port_open(f["ip"], port, 1.5):
+            save_conf(ip=f["ip"], verified_at=time.time())
+            if log:
+                log(f"kibble: found it at {f['ip']}")
+            return f["ip"]
+    return None
+
+
+def relay(ip, port):
+    """Pipe stdin/stdout to ip:port; this is all an ssh ProxyCommand has to do."""
+    s = socket.create_connection((ip, port), 10)
+    stdin_open = True
+    while True:
+        r, _, _ = select.select([s] + ([0] if stdin_open else []), [], [])
+        if s in r:
+            d = s.recv(65536)
+            if not d:
+                return
+            while d:
+                d = d[os.write(1, d):]
+        if 0 in r:
+            d = os.read(0, 65536)
+            if d:
+                s.sendall(d)
+            else:
+                stdin_open = False
+                s.shutdown(socket.SHUT_WR)
+
+
+def ssh_g(alias):
+    p = subprocess.run(["ssh", "-G", alias], capture_output=True, text=True)
+    cfg = {}
+    for l in p.stdout.splitlines():
+        k, _, v = l.partition(" ")
+        cfg.setdefault(k, []).append(v)
+    return cfg
+
+
+def learn(alias, ip=None):
+    """Remember the phone behind an ssh host: its address, user, key and SSH host key."""
+    cfg = ssh_g(alias)
+    host = cfg.get("hostname", [""])[0]
+    if ip is None and re.fullmatch(r"\d+\.\d+\.\d+\.\d+", host) and port_open(host, 22, 1.5):
+        ip = host
+    if ip is None:                       # already behind the ProxyCommand: ask the phone itself
+        p = subprocess.run(["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=10", alias,
+                            "ip -4 -o addr show wlan0"], capture_output=True, text=True)
+        m = re.search(r"inet (\d+\.\d+\.\d+\.\d+)", p.stdout)
+        ip = m.group(1) if m else None
+    keys = keyscan(ip) if ip else []
+    if not keys:                         # last resort: what known_hosts already has for the name
+        p = subprocess.run(["ssh-keygen", "-F", host], capture_output=True, text=True)
+        keys = [f"{f[1]} {f[2]}" for f in (l.split() for l in p.stdout.splitlines() if not l.startswith("#"))
+                if len(f) >= 3]
+    ident = [os.path.expanduser(i) for i in cfg.get("identityfile", []) if os.path.exists(os.path.expanduser(i))]
+    upd = dict(user=cfg.get("user", ["root"])[0], key=ident[0] if ident else None, learned_from=alias)
+    if ip:
+        upd.update(ip=ip, verified_at=time.time())
+    if keys:
+        upd["hostkeys"] = keys
+    save_conf(**upd)
+    return load_conf()
+
+
+def ssh_config_block(hosts):
+    me = os.path.abspath(__file__)
+    return f"{MARK_A}\nHost {' '.join(hosts)}\n    ProxyCommand {shlex.quote(me)} connect %p\n{MARK_B}\n"
+
+
+def strip_block(text):
+    return re.sub(re.escape(MARK_A) + r".*?" + re.escape(MARK_B) + r"\n?", "", text, flags=re.S)
+
+
+def cmd_ssh_config(args):
+    hosts = [a for a in args if not a.startswith("--")] or ["phone-root", "arch"]
+    cur = open(SSH_CONFIG).read() if os.path.exists(SSH_CONFIG) else ""
+    if "--remove" in args:
+        open(SSH_CONFIG, "w").write(strip_block(cur))
+        print(f"removed the droidkibble block from {SSH_CONFIG}")
+    elif "--install" in args:
+        bak = SSH_CONFIG + ".bak-droidkibble"
+        if cur and not os.path.exists(bak):
+            open(bak, "w").write(cur)
+            os.chmod(bak, 0o600)
+        # first match wins in ssh_config, so this goes on top and only sets ProxyCommand
+        open(SSH_CONFIG, "w").write(ssh_config_block(hosts) + "\n" + strip_block(cur))
+        print(f"added to {SSH_CONFIG} (backup: {bak}). `ssh {hosts[0]}` now finds the phone on any network.")
+    else:
+        print(ssh_config_block(hosts), end="")
+        print("\n# put that at the top of ~/.ssh/config, or run: kibble ssh-config --install")
+
+
+def fetch(host=None):
     """One round trip. Returns (state, error)."""
     try:
-        p = subprocess.run(ssh_argv(host, POLL, 15), capture_output=True, text=True, timeout=20)
+        p = subprocess.run(ssh_argv(POLL, 15), capture_output=True, text=True, timeout=20, env=child_env(),
+                           stdin=subprocess.DEVNULL)
     except (subprocess.TimeoutExpired, OSError) as e:
         return None, str(e)
     if p.returncode != 0 and "now=" not in p.stdout:
@@ -95,15 +346,22 @@ def fresh_json(st):
     return None
 
 
+def fed_age(st):
+    """Seconds since the watchdog was last fed, counted up to now (the file is rewritten right after each feed)."""
+    j = fresh_json(st)
+    if not j or not j["watchdog"]["open"]:
+        return None
+    then = j["time"] - j["watchdog"]["fed_ago_s"]
+    return max(0, int(st["now"]) - then + int(time.time() - st["fetched"]))
+
+
 def mood(st, err):
     if st is None or err:
         return "lost"
     if st.get("zygote") == "running":
         return "asleep"          # Android's own system_server feeds the watchdog
-    j = fresh_json(st)
-    if j and j["watchdog"]["open"] and j["watchdog"]["fed_ago_s"] <= FED_OK_S:
-        return "fed"
-    return "hungry"
+    age = fed_age(st)
+    return "fed" if age is not None and age <= FED_OK_S else "hungry"
 
 
 CAPTION = {"fed": ("* GOOD BOY *", "lime"), "hungry": ("! FEED ME !", "yellow"),
@@ -118,9 +376,9 @@ class Shell:
         self.cwd, self.proc = "~", None
 
     def start(self):
-        self.proc = subprocess.Popen(ssh_argv(self.app.host, self.remote), stdin=subprocess.PIPE,
-                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
-                                     errors="replace", bufsize=1)
+        self.proc = subprocess.Popen(ssh_argv(self.remote), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
+                                     stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1,
+                                     env=child_env())
         threading.Thread(target=self.reader, args=(self.proc,), daemon=True).start()
 
     def kill(self):
@@ -208,7 +466,8 @@ def panels(st, err, bw=14):
         [mode, *flag],
     ]
     ok = n["gateway_reachable"]
-    fed = w["open"] and w["fed_ago_s"] <= FED_OK_S
+    age = fed_age(st)
+    fed = age is not None and age <= FED_OK_S
     right = [
         [("ROUTER", "grey")],
         [("● " if ok else "● DOWN ", "lime" if ok else "red"),
@@ -221,7 +480,7 @@ def panels(st, err, bw=14):
         [],
         [("WATCHDOG", "grey")],
         [("● " if fed else "● ", "lime" if fed else "red"),
-         (f"fed {w['fed_ago_s']}s ago" if w["open"] else "not held", "white")],
+         (f"fed {age}s ago" if age is not None else "not held", "white")],
         [],
         [("SSH", "grey")],
         [("● ", "lime" if s["ssh_android_22"] else "red"), ("android  ", "white"),
@@ -320,32 +579,296 @@ def sprite(m, tick):
 NAMED = {"lime": 154, "cyan": 51, "yellow": 227, "red": 203, "magenta": 207, "orange": 214,
          "grey": 244, "white": 255}
 BASIC = {"lime": 2, "cyan": 6, "yellow": 3, "red": 1, "magenta": 5, "orange": 3, "grey": 7, "white": 7}
+PAIRS = {}
 
+
+def pair(fg, bg):
+    key = (fg, bg)
+    if key not in PAIRS:
+        n = len(PAIRS) + 1
+        if n >= curses.COLOR_PAIRS:
+            return 0
+        curses.init_pair(n, fg, bg)
+        PAIRS[key] = n
+    return PAIRS[key]
+
+
+def col(name):
+    if curses.COLORS >= 256:
+        return curses.color_pair(pair(NAMED[name], -1))
+    return curses.color_pair(pair(BASIC[name], -1)) | (curses.A_DIM if name == "grey" else 0)
+
+
+def setup(scr):
+    curses.raw()                              # so Ctrl-C arrives as a key, not a signal
+    curses.curs_set(1)
+    if curses.has_colors():
+        curses.start_color()
+        curses.use_default_colors()
+    else:
+        curses.COLORS = 0
+
+
+def put(scr, y, x, s, attr=0):
+    h, w = scr.getmaxyx()
+    if 0 <= y < h and x < w:
+        try:
+            scr.addnstr(y, max(0, x), s[max(0, -x):], max(0, w - max(0, x) - (1 if y == h - 1 else 0)), attr)
+        except curses.error:
+            pass
+
+
+HELP = [
+    "Enter runs the line.   Tab / Ctrl-T switches between the Android shell and the Arch chroot.",
+    "Left/Right/Home/End/Delete and Ctrl-A/E/W/K/U edit the line.  Up/Down = history.  PgUp/PgDn scroll.",
+    "Ctrl-L or `clear` clears this pane.   Ctrl-C stops a running command (or quits when idle).",
+    "F5 / :headless  headless on/off now.   F6 / :boot  go headless at boot on/off.   :connect  change phone.",
+    ":q or Ctrl-D quits.",
+]
+
+
+# ---------------------------------------------------------------- connect screen (no phone reachable)
+
+def screen(scr, title, lines, footer=""):
+    h, w = scr.getmaxyx()
+    scr.erase()
+    put(scr, 0, 0, " " * w, col("lime") | curses.A_REVERSE)
+    put(scr, 0, 1, f"* DROIDKIBBLE *  {title}", col("lime") | curses.A_REVERSE | curses.A_BOLD)
+    for i, (t, c, bold) in enumerate(lines[:h - 3]):
+        put(scr, 2 + i, 2, t, col(c) | (curses.A_BOLD if bold else 0))
+    put(scr, h - 1, 1, footer, col("grey"))
+    scr.refresh()
+
+
+def menu(scr, title, items, note="", footer="Up/Down and Enter to choose, Esc to go back"):
+    """items: list of (label, color). Returns the chosen index, or None on Esc."""
+    scr.timeout(-1)
+    curses.curs_set(0)
+    i = 0
+    while True:
+        lines = [(n, "yellow", False) for n in note.splitlines()] + ([("", "white", False)] if note else [])
+        lines += [((">  " if k == i else "   ") + label, c if k != i else "lime", k == i)
+                  for k, (label, c) in enumerate(items)]
+        screen(scr, title, lines, footer)
+        try:
+            ch = scr.get_wch()
+        except curses.error:
+            continue
+        if ch == curses.KEY_UP:
+            i = (i - 1) % len(items)
+        elif ch == curses.KEY_DOWN:
+            i = (i + 1) % len(items)
+        elif ch in ("\n", "\r"):
+            curses.curs_set(1)
+            return i
+        elif ch in ("\x1b", "\x03"):
+            curses.curs_set(1)
+            return None
+
+
+def ask(scr, title, prompt, default="", secret=False, note=""):
+    scr.timeout(-1)
+    curses.curs_set(1)
+    buf = default
+    while True:
+        lines = [(n, "yellow", False) for n in note.splitlines()] + [(prompt, "white", True)]
+        screen(scr, title, lines, "Enter to accept, Esc to go back")
+        h, w = scr.getmaxyx()
+        y = 2 + len(lines)
+        shown = "*" * len(buf) if secret else buf
+        put(scr, y, 2, "> " + shown, col("cyan") | curses.A_BOLD)
+        scr.move(min(h - 2, y), min(w - 2, 4 + len(shown)))
+        scr.refresh()
+        try:
+            ch = scr.get_wch()
+        except curses.error:
+            continue
+        if ch in ("\n", "\r"):
+            return buf
+        if ch in ("\x1b", "\x03"):
+            return None
+        if ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+            buf = buf[:-1]
+        elif ch == "\x15":
+            buf = ""
+        elif isinstance(ch, str) and ch.isprintable():
+            buf += ch
+
+
+def busy(scr, title, text):
+    screen(scr, title, [(text, "cyan", True)], "")
+
+
+def run_with_spinner(scr, title, fn, first_text):
+    """Run fn(on_status) in a thread while showing a moving line. Returns fn's result."""
+    box = {"text": first_text, "out": None, "done": False}
+
+    def work():
+        try:
+            box["out"] = fn(lambda t: box.update(text=t))
+        finally:
+            box["done"] = True
+
+    threading.Thread(target=work, daemon=True).start()
+    scr.timeout(150)
+    k = 0
+    while not box["done"]:
+        screen(scr, title, [("|/-\\"[k % 4] + "  " + box["text"], "cyan", True)], "")
+        k += 1
+        try:
+            scr.get_wch()
+        except curses.error:
+            pass
+    return box["out"]
+
+
+def private_keys():
+    d = os.path.expanduser("~/.ssh")
+    skip = {"config", "known_hosts", "known_hosts.old", "authorized_keys"}
+    keys = []
+    try:
+        for n in sorted(os.listdir(d)):
+            path = os.path.join(d, n)
+            if n in skip or n.endswith((".pub", ".bak-droidkibble")) or not os.path.isfile(path):
+                continue
+            if os.path.exists(path + ".pub"):
+                keys.append(path)
+    except OSError:
+        pass
+    return keys
+
+
+def connect_screen(scr, note=""):
+    """Find an ssh host, choose a login, test it. Returns a Target, or None to quit."""
+    title = "connect to your phone"
+    while True:
+        found = run_with_spinner(scr, title, scan, "scanning your network for ssh servers (port 22 only)...")
+        items = []
+        for f in found:
+            keys = f["keys"][0].split()[0] if f["keys"] else "no host key"
+            items.append((f"{f['ip']:<16} " + ("<- your phone (host key matches)" if f["phone"] else keys),
+                          "lime" if f["phone"] else "white"))
+        items += [("Type an address by hand", "cyan"), ("Scan again", "cyan"), ("Quit", "grey")]
+        pick = menu(scr, title, items, (note + "\n" if note else "") +
+                    (f"Found {len(found)} ssh server(s) on this network." if found else "No ssh servers found on this network."))
+        note = ""
+        if pick is None or pick == len(items) - 1:
+            return None
+        if pick == len(items) - 2:
+            continue
+        if pick == len(items) - 3:
+            ip = ask(scr, title, "Address or hostname of the phone:")
+            if not ip:
+                continue
+            ip, keys = ip.strip(), []
+        else:
+            ip, keys = found[pick]["ip"], found[pick]["keys"]
+        conf = load_conf()
+        user = ask(scr, title, f"Log in to {ip} as which user?", conf.get("user", "root"))
+        if not user:
+            continue
+        while True:
+            ks = private_keys()
+            opts = [(f"key: {k.replace(os.path.expanduser('~'), '~')}", "white") for k in ks]
+            opts += [("password", "white"), ("my ssh agent / default keys", "white"), ("(back)", "grey")]
+            j = menu(scr, title, opts, note or f"How should I log in as {user}@{ip}?")
+            note = ""
+            if j is None or j == len(opts) - 1:
+                break
+            if j < len(ks):
+                t, auth, key = key_target(ip, user, ks[j]), "key", ks[j]
+            elif j == len(ks):
+                pw = ask(scr, title, f"Password for {user}@{ip} (kept in memory only):", secret=True)
+                if pw is None:
+                    continue
+                t, auth, key = password_target(ip, user, pw), "password", None
+            else:
+                t, auth, key = key_target(ip, user, None), "default", None
+            busy(scr, title, f"trying {user}@{ip} ...")
+            ok, err = works(t)
+            if ok:
+                hostkeys = keys or keyscan(ip)
+                save_conf(ip=ip, user=user, key=key, auth=auth, verified_at=time.time(),
+                          **({"hostkeys": hostkeys} if hostkeys else {}))
+                return t
+            note = f"That didn't work: {err}"
+
+
+def initial_target(scr, host):
+    title = "connecting"
+    if host:
+        busy(scr, title, f"connecting to {host} ...")
+        t = Target(host)
+        ok, err = works(t)
+        if ok:
+            return t
+        return connect_screen(scr, f"Couldn't reach '{host}': {err}")
+    conf = load_conf()
+    note = ""
+    if conf.get("hostkeys"):
+        busy(scr, title, "looking for your phone ...")
+        ip = resolve_phone()
+        if ip:
+            if conf.get("auth") == "password":
+                pw = ask(scr, title, f"Password for {conf.get('user', 'root')}@{ip}:", secret=True)
+                t = password_target(ip, conf.get("user", "root"), pw) if pw else None
+            else:
+                t = key_target(ip, conf.get("user", "root"), conf.get("key"))
+            if t:
+                ok, err = works(t)
+                if ok:
+                    return t
+                note = f"Found the phone at {ip}, but logging in failed: {err}"
+        else:
+            note = "Couldn't find your phone on this network."
+    return connect_screen(scr, note)
+
+
+# ---------------------------------------------------------------- the dashboard
 
 class App:
-    def __init__(self, host, interval):
-        self.host, self.interval = host, interval
+    def __init__(self, interval):
+        self.interval = interval
         self.state = self.err = None
         self.out = collections.deque(maxlen=2000)
         self.scroll = 0
-        self.buf, self.hist, self.hpos = "", [], 0
+        self.buf, self.cur, self.hist, self.hpos = "", 0, [], 0
         self.lock = threading.Lock()
         self.active = None                       # the Shell running a command right now
         self.busy_since = 0.0
         self.quit = False
+        self.want_connect = False
+        self.confirm = None                      # (question, function) waiting for y/n
+        self.remembered = False
         self.wake = threading.Event()
+        self.reset_shells()
+
+    def reset_shells(self):
+        for sh in getattr(self, "shells", {}).values():
+            sh.kill()
         self.shells = {"android": Shell(self, "android", "sh"),
                        "arch": Shell(self, "arch", f"{BASE}/arch.sh run sh")}
-        self.pairs = {}
+        self.current = "android"
+        self.active = None
 
     # -- background pieces
     def poller(self):
         while not self.quit:
-            st, err = fetch(self.host)
+            st, err = fetch()
             with self.lock:
                 self.state, self.err = st, err
+            j = fresh_json(st)
+            if j and not self.remembered and TARGET.host and "@" not in TARGET.host:
+                self.remembered = True           # an ssh alias: note where the phone is now
+                threading.Thread(target=self.remember, args=(j["network"]["ip"],), daemon=True).start()
             self.wake.wait(self.interval)
             self.wake.clear()
+
+    def remember(self, ip):
+        try:
+            learn(TARGET.host, ip=ip)
+        except Exception:
+            pass
 
     def add(self, line):
         with self.lock:
@@ -358,11 +881,23 @@ class App:
         self.wake.set()
 
     def submit(self, line):
+        if line in ("clear", "cls", "@arch clear"):
+            with self.lock:
+                self.out.clear()
+            self.scroll = 0
+            return
+        if line.startswith(":"):
+            return self.colon(line[1:].strip())
         if self.active:
             self.add("[still running; Ctrl-C stops it]")
             return
-        shell = self.shells["arch" if line.startswith("@arch") else "android"]
-        cmd = line[5:].strip() if shell.name == "arch" else line
+        name = "arch" if line.startswith("@arch ") else self.current
+        shell = self.shells[name]
+        cmd = line[6:].strip() if line.startswith("@arch ") else line
+        if cmd == "clear":
+            with self.lock:
+                self.out.clear()
+            return
         self.add(f"{shell.name}:{shell.cwd}$ {cmd}")
         with self.lock:
             self.active, self.busy_since = shell, time.time()
@@ -372,6 +907,21 @@ class App:
             self.add(f"[could not send: {e}]")
             self.finish(shell)
 
+    def colon(self, cmd):
+        if cmd in ("q", "quit"):
+            self.quit = True
+        elif cmd == "headless":
+            self.toggle_headless()
+        elif cmd == "boot":
+            self.toggle_boot()
+        elif cmd == "connect":
+            self.want_connect = True
+        elif cmd in ("help", "?", ""):
+            for l in HELP:
+                self.add(l)
+        else:
+            self.add(f"[unknown command :{cmd}; try :help]")
+
     def stop_running(self, why):
         with self.lock:
             sh, self.active = self.active, None
@@ -379,41 +929,70 @@ class App:
             sh.kill()
             self.add(f"[{why}; the {sh.name} shell was dropped and starts fresh next time]")
 
-    # -- colors
-    def col(self, name):
-        if curses.COLORS >= 256:
-            return curses.color_pair(self.pair(NAMED[name], -1))
-        return curses.color_pair(self.pair(BASIC[name], -1)) | (curses.A_DIM if name == "grey" else 0)
+    # -- headless controls
+    def toggle_headless(self):
+        st = self.state
+        if not st:
+            self.add("[can't reach the phone right now]")
+        elif st.get("zygote") == "running":
+            self.confirm = ("Go headless now? The screen goes dark and Android stops.  [y/N]",
+                            lambda: self.detached("off"))
+        else:
+            self.confirm = ("Bring the Android UI back now?  [y/N]", lambda: self.detached("on"))
 
-    def pair(self, fg, bg):
-        key = (fg, bg)
-        if key not in self.pairs:
-            n = len(self.pairs) + 1
-            if n >= curses.COLOR_PAIRS:
-                return 0
-            curses.init_pair(n, fg, bg)
-            self.pairs[key] = n
-        return self.pairs[key]
+    def toggle_boot(self):
+        st = self.state
+        if not st:
+            self.add("[can't reach the phone right now]")
+        elif st.get("headless_flag") == "1":
+            self.confirm = ("Stop going headless at boot?  [y/N]",
+                            lambda: self.action(f"rm -f {BASE}/headless", "headless at boot: off"))
+        else:
+            self.confirm = ("Go headless at every boot?  [y/N]",
+                            lambda: self.action(f"touch {BASE}/headless", "headless at boot: on"))
+
+    def action(self, remote, label, then=None):
+        def work():
+            self.add(f"[{label} ...]")
+            try:
+                p = subprocess.run(ssh_argv(remote, 60), capture_output=True, text=True, timeout=70,
+                                   env=child_env(), stdin=subprocess.DEVNULL)
+                for l in (p.stdout + p.stderr).splitlines():
+                    if l and not l.startswith("**"):
+                        self.add(l)
+                self.add(f"[{label}: done]" if p.returncode == 0 else f"[{label}: failed, exit {p.returncode}]")
+            except (subprocess.TimeoutExpired, OSError) as e:
+                self.add(f"[{label}: {e}]")
+            self.wake.set()
+            if then:
+                then()
+        threading.Thread(target=work, daemon=True).start()
+
+    def detached(self, which):
+        """ui.sh takes a while and stops or starts Android's services, so run it detached and read its log."""
+        log = "/data/local/tmp/kibble-ui.log"
+        remote = f"nohup sh -c '{BASE}/ui.sh {which}' > {log} 2>&1 < /dev/null & echo started"
+
+        def later():
+            time.sleep(25)
+            self.action(f"cat {log}", f"ui.sh {which} log")
+        self.action(remote, f"ui.sh {which}", then=lambda: threading.Thread(target=later, daemon=True).start())
 
     # -- drawing
     def draw(self, scr):
         h, w = scr.getmaxyx()
         scr.erase()
 
-        def put(y, x, s, attr=0):
-            if 0 <= y < h and x < w:
-                try:
-                    scr.addnstr(y, max(0, x), s[max(0, -x):], max(0, w - max(0, x) - (1 if y == h - 1 else 0)), attr)
-                except curses.error:
-                    pass
+        def P(y, x, s, attr=0):
+            put(scr, y, x, s, attr)
 
         def segs(y, x, pieces):
             for text, color in pieces:
-                put(y, x, text, self.col(color))
+                P(y, x, text, col(color))
                 x += len(text)
 
         if h < 18 or w < 60:
-            put(0, 0, "terminal too small (need about 60x18, 100x30 is nicer)")
+            P(0, 0, "terminal too small (need about 60x18, 100x30 is nicer)")
             scr.refresh()
             return
         with self.lock:
@@ -422,15 +1001,13 @@ class App:
         color256 = curses.COLORS >= 256
         j = fresh_json(st)
 
-        # header
         age = f"updated {fmt_dur(time.time() - st['fetched'])} ago" if st else "no data"
         up = f"   UP {fmt_dur(j['uptime_s'])}" if j else ""
-        put(0, 0, " " * w, self.col("lime") | curses.A_REVERSE)
-        put(0, 1, "* DROIDKIBBLE *", self.col("lime") | curses.A_REVERSE | curses.A_BOLD)
-        info = f"{self.host}{up}   {age} "
-        put(0, max(18, w - len(info)), info, self.col("lime") | curses.A_REVERSE)
+        P(0, 0, " " * w, col("lime") | curses.A_REVERSE)
+        P(0, 1, "* DROIDKIBBLE *", col("lime") | curses.A_REVERSE | curses.A_BOLD)
+        info = f"{TARGET.host}{up}   {age} "
+        P(0, max(18, w - len(info)), info, col("lime") | curses.A_REVERSE)
 
-        # the play field: everything above the bottom-third terminal
         term_h = max(6, h // 3)
         field_top, field_h = 1, h - term_h - 2
         tick = int(time.time() * 2)
@@ -449,36 +1026,35 @@ class App:
                     if top is None and bot is None:
                         continue
                     if bot is None:
-                        put(dy + r, dx + x, "▀", curses.color_pair(self.pair(top, -1)))
+                        P(dy + r, dx + x, "▀", curses.color_pair(pair(top, -1)))
                     elif top is None:
-                        put(dy + r, dx + x, "▄", curses.color_pair(self.pair(bot, -1)))
+                        P(dy + r, dx + x, "▄", curses.color_pair(pair(bot, -1)))
                     else:
-                        put(dy + r, dx + x, "▀", curses.color_pair(self.pair(top, bot)))
+                        P(dy + r, dx + x, "▀", curses.color_pair(pair(top, bot)))
             if m == "asleep":
-                put(dy + 1, dx + 31, "z" if tick % 2 else "Z", self.col("cyan") | curses.A_BOLD)
-                put(dy - 0, dx + 34, "Z" if tick % 2 else "z", self.col("cyan") | curses.A_BOLD)
+                P(dy + 1, dx + 31, "z" if tick % 2 else "Z", col("cyan") | curses.A_BOLD)
+                P(dy, dx + 34, "Z" if tick % 2 else "z", col("cyan") | curses.A_BOLD)
             elif m == "lost":
-                put(dy + 1, dx + 33, "?", self.col("red") | curses.A_BOLD)
-                put(dy + 0, dx + 36, "?" if tick % 2 else " ", self.col("red") | curses.A_BOLD)
+                P(dy + 1, dx + 33, "?", col("red") | curses.A_BOLD)
+                P(dy, dx + 36, "?" if tick % 2 else " ", col("red") | curses.A_BOLD)
         else:
             for i, l in enumerate(art):
-                put(dy + i, dx, l, self.col(capcol) | curses.A_BOLD)
-        put(dy + dh + 1, (w - len(cap)) // 2, cap, self.col(capcol) | curses.A_BOLD)
+                P(dy + i, dx, l, col(capcol) | curses.A_BOLD)
+        P(dy + dh + 1, (w - len(cap)) // 2, cap, col(capcol) | curses.A_BOLD)
 
-        # side panels, or one stacked block under the dog when the window is narrow
         side = dx - 2
         left, right = panels(st, err, bw=max(8, min(14, side - 12)))
         if side >= 24:
-            for (lines, x0, title, tc) in ((left, 1, " VITALS ", "cyan"), (right, dx + dw + 1, " LINK ", "magenta")):
+            for (lines, x0, ttl, tc) in ((left, 1, " VITALS ", "cyan"), (right, dx + dw + 1, " LINK ", "magenta")):
                 pw = side - 1 if x0 == 1 else w - x0 - 1
-                put(dy, x0, "┌─" + title + "─" * max(0, pw - len(title) - 3) + "┐", self.col(tc))
+                P(dy, x0, "┌─" + ttl + "─" * max(0, pw - len(ttl) - 3) + "┐", col(tc))
                 nrows = min(len(lines), field_h - 2)
                 for i in range(nrows + 1):
-                    put(dy + 1 + i, x0, "│", self.col(tc))
-                    put(dy + 1 + i, x0 + pw - 1, "│", self.col(tc))
+                    P(dy + 1 + i, x0, "│", col(tc))
+                    P(dy + 1 + i, x0 + pw - 1, "│", col(tc))
                     if i < nrows:
                         segs(dy + 1 + i, x0 + 2, lines[i])
-                put(dy + nrows + 1, x0, "└" + "─" * (pw - 2) + "┘", self.col(tc))
+                P(dy + nrows + 1, x0, "└" + "─" * (pw - 2) + "┘", col(tc))
         else:
             y = dy + dh + 3
             for line in left + right:
@@ -488,28 +1064,47 @@ class App:
 
         # terminal: the bottom third
         sep = h - term_h - 1
-        shell = self.shells["arch" if self.buf.startswith("@arch") else "android"]
+        cur = "arch" if self.buf.startswith("@arch ") else self.current
+        shell = self.shells[cur]
         title = f" TERMINAL  {shell.name}:{shell.cwd} "
-        put(sep, 0, "━" * w, self.col("orange"))
-        put(sep, 2, title[:w - 4], self.col("orange") | curses.A_BOLD)
-        if active:
-            put(sep, max(len(title) + 4, w - 22), " running... Ctrl-C stops ", self.col("yellow") | curses.A_BOLD)
+        P(sep, 0, "━" * w, col("orange"))
+        P(sep, 2, title[:w - 4], col("orange") | curses.A_BOLD)
+        hint = " running... Ctrl-C stops " if active else " Tab shell · F5 headless · F6 boot · :help "
+        P(sep, max(len(title) + 4, w - len(hint) - 2), hint, col("yellow" if active else "grey") | (curses.A_BOLD if active else 0))
         room = term_h - 1
         end = len(out) - self.scroll
         for i, l in enumerate(out[max(0, end - room):end]):
             first = l.split(" ", 1)[0]
-            attr = self.col("cyan") if first.endswith("$") else self.col("red") if l.startswith("[") else 0
-            put(sep + 1 + i, 1, l, attr)
-        prompt = f"{shell.name}> "
-        put(h - 1, 0, prompt, self.col("orange") | curses.A_BOLD)
-        put(h - 1, len(prompt), self.buf, curses.A_BOLD)
-        try:
-            scr.move(h - 1, min(w - 2, len(prompt) + len(self.buf)))
-        except curses.error:
-            pass
+            attr = col("cyan") if first.endswith("$") else col("red") if l.startswith("[") else 0
+            P(sep + 1 + i, 1, l, attr)
+        if self.confirm:
+            P(h - 1, 0, self.confirm[0], col("yellow") | curses.A_BOLD)
+            try:
+                scr.move(h - 1, min(w - 2, len(self.confirm[0])))
+            except curses.error:
+                pass
+        else:
+            prompt = f"{shell.name}> "
+            avail = max(5, w - len(prompt) - 2)
+            off = max(0, self.cur - avail + 1)
+            P(h - 1, 0, prompt, col("orange") | curses.A_BOLD)
+            P(h - 1, len(prompt), self.buf[off:off + avail], curses.A_BOLD)
+            try:
+                scr.move(h - 1, min(w - 2, len(prompt) + self.cur - off))
+            except curses.error:
+                pass
         scr.refresh()
 
     def key(self, ch):
+        if self.confirm:
+            q, fn = self.confirm
+            self.confirm = None
+            if ch in ("y", "Y"):
+                fn()
+            else:
+                self.add("[cancelled]")
+            return
+        b, c = self.buf, self.cur
         if ch == "\x04":
             self.quit = True
         elif ch == "\x03":
@@ -518,44 +1113,78 @@ class App:
             else:
                 self.quit = True
         elif ch in ("\n", "\r"):
-            line, self.buf = self.buf.strip(), ""
-            if line in (":q", ":quit"):
-                self.quit = True
-            elif line:
+            line = b.strip()
+            self.buf, self.cur = "", 0
+            if line:
                 self.hist.append(line)
                 self.hpos = len(self.hist)
                 self.scroll = 0
                 self.submit(line)
+        elif ch in ("\t", "\x14"):
+            self.current = "arch" if self.current == "android" else "android"
+        elif ch == "\x0c":
+            with self.lock:
+                self.out.clear()
+            self.scroll = 0
         elif ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
-            self.buf = self.buf[:-1]
+            if c:
+                self.buf, self.cur = b[:c - 1] + b[c:], c - 1
+        elif ch == curses.KEY_DC:
+            self.buf = b[:c] + b[c + 1:]
+        elif ch == curses.KEY_LEFT:
+            self.cur = max(0, c - 1)
+        elif ch == curses.KEY_RIGHT:
+            self.cur = min(len(b), c + 1)
+        elif ch in (curses.KEY_HOME, "\x01"):
+            self.cur = 0
+        elif ch in (curses.KEY_END, "\x05"):
+            self.cur = len(b)
         elif ch == "\x15":
-            self.buf = ""
+            self.buf, self.cur = b[c:], 0
+        elif ch == "\x0b":
+            self.buf = b[:c]
+        elif ch == "\x17":
+            j = len(b[:c].rstrip())
+            k = b[:j].rfind(" ") + 1
+            self.buf, self.cur = b[:k] + b[c:], k
         elif ch == curses.KEY_UP and self.hist:
             self.hpos = max(0, self.hpos - 1)
             self.buf = self.hist[self.hpos]
+            self.cur = len(self.buf)
         elif ch == curses.KEY_DOWN and self.hist:
             self.hpos = min(len(self.hist), self.hpos + 1)
             self.buf = self.hist[self.hpos] if self.hpos < len(self.hist) else ""
+            self.cur = len(self.buf)
         elif ch == curses.KEY_PPAGE:
             self.scroll = min(len(self.out), self.scroll + 5)
         elif ch == curses.KEY_NPAGE:
             self.scroll = max(0, self.scroll - 5)
+        elif ch == curses.KEY_F5:
+            self.toggle_headless()
+        elif ch == curses.KEY_F6:
+            self.toggle_boot()
         elif isinstance(ch, str) and ch.isprintable():
-            self.buf += ch
+            self.buf, self.cur = b[:c] + ch + b[c:], c + 1
 
     def main(self, scr):
-        curses.raw()                              # so Ctrl-C arrives as a key, not a signal
-        curses.curs_set(1)
-        if curses.has_colors():
-            curses.start_color()
-            curses.use_default_colors()
-        else:
-            curses.COLORS = 0
         scr.timeout(250)
         threading.Thread(target=self.poller, daemon=True).start()
         while not self.quit:
             if self.active and time.time() - self.busy_since > CMD_TIMEOUT_S:
                 self.stop_running(f"no answer after {CMD_TIMEOUT_S} s")
+            if self.want_connect:
+                self.want_connect = False
+                t = connect_screen(scr)
+                if t:
+                    set_target(t)
+                    self.reset_shells()
+                    with self.lock:
+                        self.state = self.err = None
+                        self.out.clear()
+                    self.remembered = False
+                    self.wake.set()
+                scr.timeout(250)
+                curses.curs_set(1)
             self.draw(scr)
             try:
                 self.key(scr.get_wch())
@@ -565,8 +1194,14 @@ class App:
             sh.kill()
 
 
+def set_target(t):
+    global TARGET
+    TARGET = t
+
+
 def snapshot(host):
-    st, err = fetch(host)
+    set_target(Target(host))
+    st, err = fetch()
     left, right = panels(st, err)
     print("\n".join(ascii_dog(mood(st, err), 0)))
     print(CAPTION[mood(st, err)][0])
@@ -576,16 +1211,50 @@ def snapshot(host):
     return 0 if st else 1
 
 
+def run(scr, a):
+    setup(scr)
+    t = initial_target(scr, a.host)
+    if not t:
+        return
+    set_target(t)
+    App(max(2, a.interval)).main(scr)
+
+
 def main():
+    argv = sys.argv[1:]
+    cmd = argv[0] if argv else ""
+    if cmd == "connect":                    # ssh ProxyCommand: `kibble connect %p`
+        port = int(argv[1]) if len(argv) > 1 else 22
+        ip = resolve_phone(port, log=lambda m: print(m, file=sys.stderr))
+        if not ip:
+            print("kibble: can't find the phone on this network (run `kibble learn <ssh-host>` while it is "
+                  "reachable, or run `kibble` to set it up)", file=sys.stderr)
+            sys.exit(1)
+        relay(ip, port)
+        return
+    if cmd == "find":
+        ip = resolve_phone(log=lambda m: print(m, file=sys.stderr))
+        print(ip or "", end="\n" if ip else "")
+        sys.exit(0 if ip else 1)
+    if cmd == "learn" and len(argv) == 2:
+        c = learn(argv[1])
+        print(f"remembered the phone: {c.get('ip', '?')} as {c.get('user')}, "
+              f"{len(c.get('hostkeys', []))} host key(s), in {CONF}")
+        sys.exit(0 if c.get("hostkeys") else 1)
+    if cmd == "ssh-config":
+        cmd_ssh_config(argv[1:])
+        return
     ap = argparse.ArgumentParser(description="arcade-style terminal dashboard for a droidkibble phone")
-    ap.add_argument("host", help="ssh host that logs in as root on the phone")
+    ap.add_argument("host", nargs="?", default="", help="ssh host that logs in as root on the phone "
+                    "(optional: without it the phone is found automatically)")
     ap.add_argument("--interval", type=float, default=5, help="seconds between updates (default 5)")
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
-    a = ap.parse_args()
+    a = ap.parse_args(argv)
     if a.once or not sys.stdout.isatty():
         sys.exit(snapshot(a.host))
+    os.environ.setdefault("ESCDELAY", "50")
     try:
-        curses.wrapper(App(a.host, max(2, a.interval)).main)
+        curses.wrapper(lambda scr: run(scr, a))
     except KeyboardInterrupt:
         pass
 

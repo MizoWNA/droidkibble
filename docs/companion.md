@@ -7,24 +7,59 @@ The window has three parts: a pixel-art dog in the middle, battery and memory on
 ## Using it
 
 ```sh
-scripts/pc/kibble <ssh-host>            # the dashboard
+scripts/pc/kibble                       # finds the phone by itself (see "Finding the phone")
+scripts/pc/kibble <ssh-host>            # or name an ssh host that logs in as root on the phone
 scripts/pc/kibble <ssh-host> --once     # one snapshot as text, then exit
 ```
 
-`<ssh-host>` is the same root-on-the-phone host from setup step 2 (`phone-root` in the examples). It's plain `ssh` underneath, so it uses your existing key login. It stores nothing and adds no server or port to the phone. Python 3 is all it needs, no extra packages.
+It's plain `ssh` underneath, and it needs Python 3 and nothing else.
 
-Type on the bottom line and press Enter. It's a real, long-lived shell session, so `cd` and variables carry over from one command to the next. The prompt shows the current directory.
+### The bottom shell
 
-| you type | what runs |
+Type on the bottom line and press Enter. It's a real, long-lived shell session, so `cd` and variables carry over from one command to the next, and the prompt shows the current directory. There are two shells, the Android root shell and the Arch chroot, and each keeps its own directory. **Tab** (or Ctrl-T) switches between them; the prompt and title show which one is active. `@arch <cmd>` runs a single command in the chroot without switching.
+
+| key | does |
 |---|---|
-| `uptime` | in the phone's Android root shell |
-| `@arch pacman -Q \| wc -l` | in the Arch chroot, a second session that keeps its own directory |
-| `:q` or Ctrl-D | quits |
-| Ctrl-C | stops a running command (see below), or quits when nothing is running |
+| Enter | run the line in the current shell |
+| Tab / Ctrl-T | switch between the Android shell and the Arch chroot |
+| Left, Right, Home, End, Delete | move around and edit the line (Ctrl-A/E, Ctrl-W, Ctrl-K, Ctrl-U also work) |
+| Up, Down | command history |
+| PgUp, PgDn | scroll the output |
+| Ctrl-L, or `clear` | clear the output |
+| Ctrl-C | stop a running command, or quit when nothing is running |
+| :q, Ctrl-D | quit |
+| :help | list these keys |
 
-Up and Down step through history, PgUp and PgDn scroll the output, Ctrl-U clears the line. Programs that need a real terminal (`top`, `vim`) don't work here; use plain `ssh` for those.
+Programs that need a real terminal (`top`, `vim`) don't work here; use plain `ssh` for those. A command that runs for more than two minutes, or has an unbalanced quote and waits for the rest of it, is given up on. After that (and after Ctrl-C) the shell session is dropped and the next command starts a new one in the default directory. The dropped command may keep running on the phone, because the shell has no terminal to signal it through.
 
-Two limits to know about. A command with an unbalanced quote will wait for the rest of it, and a command that runs for more than two minutes is given up on. In both cases, and after Ctrl-C, that shell session is dropped and the next command starts a new one in the default directory. The dropped command may keep running on the phone, because the shell has no terminal to send it a signal.
+### Headless on and off
+
+| key | command | does |
+|---|---|---|
+| F5 | `:headless` | go headless now, or bring the Android UI back, depending on the current state |
+| F6 | `:boot` | turn "go headless at every boot" on or off (the `headless` flag file) |
+
+Both ask `[y/N]` first, since going headless turns the screen off. Under the hood this runs `ui.sh off` or `ui.sh on` on the phone, detached, and prints the script's log about 25 seconds later. The dog shows the result: it falls asleep when Android comes back and wakes up fed when the daemon takes over.
+
+## Finding the phone
+
+The usual annoyance: you move to another network, the phone gets a different address, and every `ssh` alias with the old address stops working. kibble fixes that by recognising the phone by its **SSH host key** and not its address.
+
+- **First run with no phone remembered.** kibble scans your computer's own subnet for SSH servers (port 22 only, it just reads their host keys and never tries to log in), lists them, and lets you pick one. Then it asks for a user, and how to log in: one of the keys in `~/.ssh`, your ssh agent, or a password (held in memory only, never written to disk). It tests the login, and if it works it remembers the phone in `~/.config/droidkibble/phone.json` (address, user, key path, and the host keys).
+- **Every run after that.** It tries the last address, and if the phone isn't there, it scans and picks out the host whose key matches. The other machines on the network are never logged in to.
+- **`:connect`** inside the dashboard opens the same screen to pick a different phone or log in again.
+- If you already have working ssh aliases, `kibble learn <ssh-host>` remembers that phone without the wizard.
+
+### Making every ssh command follow the phone
+
+```sh
+scripts/pc/kibble ssh-config --install          # for the hosts "phone-root" and "arch"
+scripts/pc/kibble ssh-config --install phone-root arch mything    # or name your own aliases
+```
+
+This puts a small block at the top of `~/.ssh/config` (and saves a backup as `~/.ssh/config.bak-droidkibble` the first time). It adds only a `ProxyCommand` that runs `kibble connect`, which finds the phone and relays the connection. Everything else in your config for those hosts is untouched. After that `ssh arch`, `scp`, `phonessh` and the dashboard all work from any network with no editing. Host-key checking still applies, so a different machine at the remembered address can't pose as the phone. `kibble ssh-config --remove` undoes it, and `kibble ssh-config` alone prints the block without changing anything.
+
+If the phone isn't on the same network at all (it's off, or you're somewhere else), there is nothing to find, and ssh says so.
 
 ## The dog
 
@@ -41,4 +76,6 @@ Every few seconds it makes one ssh call that reads `status.json` (written by `ph
 
 ## Status
 
-Tested on Linux, against one phone, in headless mode, driven through a pseudo-terminal at several window sizes. Checked: it draws without crashing at 100x30, 70x20, 60x18, 200x40 and shows the "too small" message at 50x12; `cd` sticks between commands in both shells and the two keep separate directories; failures show their exit code; Ctrl-C drops a stuck command and the next one works; it quits cleanly. **Not checked:** how the colors and pixel dog look on real terminals other than the one I can't see (please tell me if it looks off), the sleeping, feed-me and lost dogs on a live phone, a phone that disappears while it's open, macOS (it uses the GNU `timeout` command for the status poll, which macOS doesn't ship).
+Tested on Linux, on one phone, through a pseudo-terminal. **Checked on the real phone:** the dashboard at several window sizes; both shells keep their directory and switch with Tab; line editing with the arrow keys; `clear`; the F5 and F6 prompts, including answering no; going from headless to Android and back again through F5, and the dog changing to match; Ctrl-C dropping a stuck command; the first-run scan and login wizard against a real network (it listed the phone and one other SSH server, and logged in with a key); finding the phone again after a wrong address was cached, in about six seconds, from a different address than before; and `ssh`, `phonessh` and the dashboard following it through the ProxyCommand.
+
+**Not checked:** password login (my phone only accepts keys), so that path is written but never run; the F6 toggle actually being confirmed with `y`; how it looks on real terminals other than the one I can't see; networks larger than a /22 (only a /22 around your address is scanned); IPv6; macOS (the status poll uses the GNU `timeout` command, which macOS doesn't ship); and phones with more than one Wi-Fi address.

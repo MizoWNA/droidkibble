@@ -2,6 +2,10 @@
 
 Optional things that aren't needed to run the phone as a server.
 
+## Moving between networks
+
+`phonessh` uses the ssh hosts `arch` and `phone-root`, which normally have a fixed address. If the phone changes network, run `scripts/pc/kibble ssh-config --install` once and both hosts follow it automatically. See [docs/companion.md](../docs/companion.md).
+
 ## phonessh
 
 A small script that opens a shell on the phone that looks like your own terminal, recolored so you can tell the two apart at a glance. It assumes you use zsh with oh-my-zsh on your computer.

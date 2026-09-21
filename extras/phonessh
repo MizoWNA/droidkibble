@@ -25,6 +25,7 @@ reachable() { ssh -o ConnectTimeout=5 -o BatchMode=yes "$1" true 2>/dev/null; }
 
 unreachable_hint() {
     echo "phonessh: can't reach '$1'. Is the phone on and on Wi-Fi?" >&2
+    echo "          If you switched networks: kibble ssh-config --install makes ssh find the phone by itself." >&2
     echo "          try: ping \$(ssh -G $1 | awk '/^hostname /{print \$2}')" >&2
     exit 1
 }
