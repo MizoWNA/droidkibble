@@ -38,6 +38,7 @@ verified on real hardware is marked as such.
   `/data` is mounted `nosuid` on Android, which broke `sudo` for non-root users.
 
 ### Verified on hardware (Galaxy A30, Android 11, kernel 4.4)
+- Going headless on a second network (a cafe router, 192.168.3.x): the daemon picked up the new gateway and the router renewed the lease (86400 s). `diagnose.sh` with the UI running shows `system_server` holding `/dev/watchdog1` and `watchdogd` holding `/dev/watchdog`, matching the write-up.
 - Leaving the router's range while headless: the daemon logged `network down`, and 5 min 8 s later restored the Android UI (`restoring the Android UI: router unreachable for too long`), released the watchdog and stopped. The phone did not reset, stayed up, and Android was usable on a different network afterwards. Seen once, on one phone.
 - `scripts/pc/install.sh` deployed to the phone, then a reboot: the chroot, its sshd and
   headless mode all came back from the installed paths.
