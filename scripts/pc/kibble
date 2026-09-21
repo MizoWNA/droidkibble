@@ -1,28 +1,29 @@
 #!/usr/bin/env python3
-"""kibble: a small terminal dashboard for a droidkibble phone.
+"""kibble: an arcade-style terminal dashboard for a droidkibble phone.
 
-Shows battery, memory, network, DHCP and watchdog state, with a dog that tells you
-at a glance whether the watchdog is being fed. Type a command at the bottom and press
-Enter to run it on the phone.
+A pixel dog in the middle tells you whether the watchdog is being fed. Battery and memory
+are on its left, network, DHCP and watchdog details on its right, and the bottom third is a
+shell on the phone.
 
-It only wraps ssh (key login, nothing stored). Python 3 standard library only.
+It only wraps ssh (key login, nothing stored). Python 3 standard library only. Wants a
+terminal with 256 colors and about 100x30; on less it falls back to a small ASCII dog.
 
     kibble <ssh-host>            dashboard (an ssh host that logs in as root on the phone)
-    kibble <ssh-host> --once     print one snapshot and exit (also handy in scripts)
+    kibble <ssh-host> --once     print one snapshot as text and exit (also handy in scripts)
 
-In the dashboard:
+Bottom shell (it is a real session, so cd and variables stick):
     <text> + Enter   run in the phone's Android root shell
-    @arch <text>     run inside the Arch chroot instead
+    @arch <text>     run in the Arch chroot session instead (it has its own directory)
     Up / Down        command history          PgUp / PgDn   scroll the output
-    Ctrl-U           clear the line           Ctrl-C, Ctrl-D or :q   quit
-Programs that need a terminal (top, vim, ...) don't work; use ssh for those.
+    Ctrl-U           clear the line           :q or Ctrl-D  quit
+    Ctrl-C           stop a running command (drops that shell session), or quit when idle
+Programs that need a terminal (top, vim, ...) don't work here; use ssh for those.
 """
 import argparse
 import collections
 import curses
 import json
 import os
-import shlex
 import subprocess
 import sys
 import threading
@@ -35,22 +36,27 @@ POLL = (
     f'echo ---json; cat $D/status.json 2>/dev/null; echo; '
     f'echo ---once; $D/phoneserverd --once 2>/dev/null'
 )
+DONE = "__KB_DONE__"
 FED_OK_S = 15          # the daemon feeds every 5 s; slower than this looks wrong
 STALE_S = 20           # status.json older than this is not from a running daemon
+CMD_TIMEOUT_S = 120
 
 
-def ssh_cmd(host, remote, timeout):
-    opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5",
+# ---------------------------------------------------------------- talking to the phone
+
+def ssh_argv(host, remote, timeout=None):
+    cache = os.path.expanduser("~/.cache/droidkibble")
+    os.makedirs(cache, exist_ok=True)
+    argv = ["ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5",
             "-o", "ControlMaster=auto", "-o", "ControlPersist=120",
-            "-o", "ControlPath=" + os.path.expanduser("~/.cache/droidkibble/cm-%C")]
-    os.makedirs(os.path.expanduser("~/.cache/droidkibble"), exist_ok=True)
-    return ["timeout", str(timeout), "ssh", *opts, host, remote]
+            "-o", f"ControlPath={cache}/cm-%C", host, remote]
+    return ["timeout", str(timeout)] + argv if timeout else argv
 
 
 def fetch(host):
     """One round trip. Returns (state, error)."""
     try:
-        p = subprocess.run(ssh_cmd(host, POLL, 15), capture_output=True, text=True, timeout=20)
+        p = subprocess.run(ssh_argv(host, POLL, 15), capture_output=True, text=True, timeout=20)
     except (subprocess.TimeoutExpired, OSError) as e:
         return None, str(e)
     if p.returncode != 0 and "now=" not in p.stdout:
@@ -100,28 +106,61 @@ def mood(st, err):
     return "hungry"
 
 
-DOG = {
-    "fed": ["   __       ", " o(__)\\____ ", "  /     __)%s", " (_|_|--|_|  ", "  good boy   "],
-    "hungry": ["   __       ", " o(__)\\____ ", "  /     __)_", " (_|_|--|_|  ", " feed me! \\_/"],
-    "asleep": ["       %s   ", "   ___      ", " (_____)\\__ ", " (_|_|--|_|  ", "  sleeping   "],
-    "lost": ["  ?  __     ", " o(__)\\____ ", "  /     __)_", " (_|_|--|_|  ", " where is it "],
-}
-MOOD_COLOR = {"fed": 2, "hungry": 3, "asleep": 4, "lost": 1}
+CAPTION = {"fed": ("* GOOD BOY *", "lime"), "hungry": ("! FEED ME !", "yellow"),
+           "asleep": ("z z z   ANDROID IS ON", "cyan"), "lost": ("? SIGNAL LOST ?", "red")}
 
 
-def dog(m, tick):
-    art = DOG[m]
-    if m == "fed":
-        art = [l % ("~" if tick % 2 else "-") if "%s" in l else l for l in art]
-    elif m == "asleep":
-        art = [l % ("z" if tick % 2 else "Z") if "%s" in l else l for l in art]
-    return art
+class Shell:
+    """A long-lived shell over ssh, so cd and variables carry from one command to the next."""
+
+    def __init__(self, app, name, remote):
+        self.app, self.name, self.remote = app, name, remote
+        self.cwd, self.proc = "~", None
+
+    def start(self):
+        self.proc = subprocess.Popen(ssh_argv(self.app.host, self.remote), stdin=subprocess.PIPE,
+                                     stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,
+                                     errors="replace", bufsize=1)
+        threading.Thread(target=self.reader, args=(self.proc,), daemon=True).start()
+
+    def kill(self):
+        if self.proc and self.proc.poll() is None:
+            self.proc.kill()
+        self.proc = None
+
+    def run(self, line):
+        if not self.proc or self.proc.poll() is not None:
+            self.start()
+        # stdin from /dev/null so a command can't swallow the lines meant for the shell
+        self.proc.stdin.write(f'{{ {line}\n}} </dev/null 2>&1; echo "{DONE} $? $PWD"\n')
+        self.proc.stdin.flush()
+
+    def reader(self, proc):
+        for raw in proc.stdout:
+            line = raw.rstrip("\n").replace("\t", "    ")
+            i = line.find(DONE)
+            if i < 0:
+                self.app.add(line)
+                continue
+            if line[:i]:
+                self.app.add(line[:i])
+            rc, _, cwd = line[i + len(DONE):].strip().partition(" ")
+            self.cwd = cwd or self.cwd
+            if rc not in ("0", ""):
+                self.app.add(f"[exit {rc}]")
+            self.app.finish(self)
+        if proc is self.proc:                    # the shell itself ended (e.g. `exit`)
+            self.proc = None
+            self.app.add(f"[{self.name} shell closed; the next command starts a new one]")
+            self.app.finish(self)
 
 
-def bar(pct, width=14):
+# ---------------------------------------------------------------- what to show
+
+def bar(pct, width, color):
     pct = max(0, min(100, pct))
     n = round(width * pct / 100)
-    return "[" + "#" * n + "-" * (width - n) + "]"
+    return [("█" * n, color), ("░" * (width - n), "grey")]
 
 
 def fmt_dur(s):
@@ -133,35 +172,154 @@ def fmt_dur(s):
     return f"{s // 3600}h{(s % 3600) // 60:02d}m"
 
 
-def stats(st, err):
-    """Lines of (text, color) for the status block."""
+def level(pct, warn, bad):
+    return "red" if pct >= bad else "yellow" if pct >= warn else "lime"
+
+
+def panels(st, err, bw=14):
+    """(left, right): lists of lines, each a list of (text, color) pieces."""
     if st is None:
-        return [(f"can't reach the phone: {err}", 1)]
+        return [[(f"can't reach the phone:", "red")], [(str(err), "red")]], []
     j = fresh_json(st)
     zy = st.get("zygote", "?")
-    mode = "Android UI on" if zy == "running" else "headless" if zy == "stopped" else f"zygote {zy}"
-    out = [(f"mode      {mode}" + ("  (headless flag set)" if st.get("headless_flag") == "1" else ""), 0)]
-    if j:
-        b, m, n, d, w = j["battery"], j["memory"], j["network"], j["dhcp"], j["watchdog"]
-        out.append((f"battery   {bar(b['percent'])} {b['percent']}%  {b['state']}  {b['temp_c']}C", 0))
-        used = m["used_mb"]; tot = m["total_mb"]
-        out.append((f"memory    {bar(100 * used // tot)} {used}/{tot} MB", 0))
-        out.append((f"network   {n['ip']} via {n['gateway']}  router {'ok' if n['gateway_reachable'] else 'DOWN ' + fmt_dur(n['down_for_s'])}",
-                    0 if n["gateway_reachable"] else 1))
-        if d["enabled"]:
-            out.append((f"dhcp      lease {fmt_dur(d['lease_s'])}, next renewal in {fmt_dur(d['next_renewal_in_s'])}"
-                        + (f", {d['naks']} NAK" if d["naks"] else ""), 0))
-        out.append((f"watchdog  {w['device']} fed {w['fed_ago_s']}s ago" if w["open"] else "watchdog  not held by the daemon",
-                    0 if w["open"] else 3))
-        s = j["services"]
-        out.append(("ssh       android " + ("up" if s["ssh_android_22"] else "DOWN")
-                    + ", chroot " + ("up" if s["ssh_chroot_2222"] else "DOWN"), 0))
-        out.append((f"phone up  {fmt_dur(j['uptime_s'])}", 0))
+    mode = ("Android UI on", "cyan") if zy == "running" else ("headless", "lime") if zy == "stopped" \
+        else (f"zygote {zy}", "yellow")
+    flag = [("  (flag set)", "grey")] if st.get("headless_flag") == "1" else []
+    if not j:
+        left = [[("MODE", "grey")], [mode, *flag], []]
+        left += [[(l, "white")] for l in st["once"]]
+        right = [[("DAEMON", "grey")],
+                 [("not running (fine while Android is on)", "cyan")] if zy == "running"
+                 else [("NOT RUNNING and the UI is off!", "red")], [("run ui.sh on", "red")] if zy != "running" else []]
+        return left, right
+    b, m, n, d, w, s = j["battery"], j["memory"], j["network"], j["dhcp"], j["watchdog"], j["services"]
+    bc = "red" if b["percent"] < 20 else "yellow" if b["percent"] < 50 else "lime"
+    mp = 100 * m["used_mb"] // m["total_mb"]
+    left = [
+        [("BATTERY", "grey")],
+        bar(b["percent"], bw, bc) + [(f" {b['percent']}%", bc)],
+        [(f"{b['state']}  {b['temp_c']}°C", "white")],
+        [],
+        [("MEMORY", "grey")],
+        bar(mp, bw, level(mp, 60, 85)) + [(f" {m['used_mb']}MB", "white")],
+        [(f"of {m['total_mb']} MB", "grey")],
+        [],
+        [("MODE", "grey")],
+        [mode, *flag],
+    ]
+    ok = n["gateway_reachable"]
+    fed = w["open"] and w["fed_ago_s"] <= FED_OK_S
+    right = [
+        [("ROUTER", "grey")],
+        [("● " if ok else "● DOWN ", "lime" if ok else "red"),
+         (n["ip"] if ok else fmt_dur(n["down_for_s"]), "white")],
+        [(f"via {n['gateway']}", "grey")],
+        [],
+        [("DHCP", "grey")],
+        [((f"lease {fmt_dur(d['lease_s'])}, renew {fmt_dur(d['next_renewal_in_s'])}"
+           + (f", {d['naks']} NAK" if d["naks"] else "")) if d["enabled"] else "off", "white")],
+        [],
+        [("WATCHDOG", "grey")],
+        [("● " if fed else "● ", "lime" if fed else "red"),
+         (f"fed {w['fed_ago_s']}s ago" if w["open"] else "not held", "white")],
+        [],
+        [("SSH", "grey")],
+        [("● ", "lime" if s["ssh_android_22"] else "red"), ("android  ", "white"),
+         ("● ", "lime" if s["ssh_chroot_2222"] else "red"), ("chroot", "white")],
+        [],
+        [("PHONE UP", "grey")],
+        [(fmt_dur(j["uptime_s"]), "white")],
+    ]
+    return left, right
+
+
+# ---------------------------------------------------------------- the dog
+
+ASCII_DOG = {
+    "fed": ["   __       ", " o(__)\\____ ", "  /     __)%s", " (_|_|--|_|  ", "  good boy   "],
+    "hungry": ["   __       ", " o(__)\\____ ", "  /     __)_", " (_|_|--|_|  ", " feed me! \\_/"],
+    "asleep": ["       %s   ", "   ___      ", " (_____)\\__ ", " (_|_|--|_|  ", "  sleeping   "],
+    "lost": ["  ?  __     ", " o(__)\\____ ", "  /     __)_", " (_|_|--|_|  ", " where is it "],
+}
+
+
+def ascii_dog(m, tick):
+    sub = {"fed": "~-", "asleep": "zZ"}.get(m)
+    return [l % sub[tick % 2] if sub and "%s" in l else l for l in ASCII_DOG[m]]
+
+
+PW, PH = 42, 26          # sprite size in pixels; two pixels per terminal row (half blocks)
+PAL = dict(tan=180, shade=137, dark=94, white=255, black=16, pink=211, red=196, gold=220,
+           bowl=67, bowl2=61, kib=130)
+
+
+def ellipse(c, cx, cy, rx, ry, col):
+    cx += 1; cy += 1                                   # 1 px margin for the outline
+    for y in range(int(cy - ry) - 1, int(cy + ry) + 2):
+        for x in range(int(cx - rx) - 1, int(cx + rx) + 2):
+            if 0 <= x < PW and 0 <= y < PH and ((x - cx) / rx) ** 2 + ((y - cy) / ry) ** 2 <= 1:
+                c[y][x] = col
+
+
+def box(c, x0, y0, x1, y1, col):
+    for y in range(y0 + 1, y1 + 2):
+        for x in range(x0 + 1, x1 + 2):
+            if 0 <= x < PW and 0 <= y < PH:
+                c[y][x] = col
+
+
+def sprite(m, tick):
+    """The dog as PH rows of PW palette colors (or None). Drawn back to front."""
+    c = [[None] * PW for _ in range(PH)]
+    wag = tick % 2
+    tail = ([(10, 15), (8, 12), (6, 9), (5, 7)] if wag else [(10, 15), (7, 14), (4, 12), (2, 11)]) \
+        if m == "fed" else [(10, 16), (8, 19), (7, 21)]
+    for x, y in tail:
+        ellipse(c, x, y, 1.7, 1.7, PAL["shade"])
+    ellipse(c, 17, 16, 9, 6, PAL["tan"])               # body
+    ellipse(c, 13, 18, 5, 4, PAL["shade"])             # hind leg
+    box(c, 9, 21, 15, 22, PAL["tan"])                  # hind paw
+    box(c, 22, 15, 26, 21, PAL["tan"])                 # front leg
+    box(c, 21, 22, 27, 23, PAL["white"])               # front paws
+    ellipse(c, 24, 15, 3, 4, PAL["white"])             # chest
+    box(c, 21, 8, 27, 15, PAL["tan"])                  # neck
+    box(c, 21, 12, 27, 13, PAL["red"])                 # collar
+    box(c, 25, 14, 26, 15, PAL["gold"])                # tag
+    ellipse(c, 22, 7, 2.5, 5, PAL["shade"])            # ear
+    ellipse(c, 27, 8, 6, 5, PAL["tan"])                # head
+    ellipse(c, 33, 10, 4, 3, PAL["white"])             # snout
+    box(c, 36, 8, 37, 9, PAL["black"])                 # nose
+    box(c, 30, 12, 35, 12, PAL["dark"])                # mouth
+    if m == "fed":
+        box(c, 33, 12, 34, 14, PAL["pink"])            # tongue
+    if m == "asleep":
+        box(c, 28, 7, 30, 7, PAL["black"])             # closed eye
     else:
-        out.append(("daemon    not running (fine while Android's UI is on)" if zy == "running"
-                    else "daemon    NOT RUNNING and the UI is off. Run ui.sh on", 0 if zy == "running" else 1))
-        out.extend((l, 0) for l in st["once"])
+        box(c, 28, 6, 29, 7, PAL["black"])
+        c[7][30] = PAL["white"]                        # eye highlight
+    if m == "hungry":
+        for x, y in ((27, 4), (28, 4), (29, 5)):       # worried brow
+            c[y + 1][x + 1] = PAL["dark"]
+    box(c, 30, 21, 38, 22, PAL["bowl"])                # bowl
+    box(c, 31, 23, 37, 23, PAL["bowl2"])
+    if m == "fed":
+        for x, y in ((32, 20), (34, 20), (36, 20), (33, 19), (35, 19)):
+            c[y + 1][x + 1] = PAL["kib"]
+    # dark outline around everything
+    out = [row[:] for row in c]
+    for y in range(PH):
+        for x in range(PW):
+            if c[y][x] is None and any(0 <= y + dy < PH and 0 <= x + dx < PW and c[y + dy][x + dx] is not None
+                                       for dx, dy in ((1, 0), (-1, 0), (0, 1), (0, -1))):
+                out[y][x] = PAL["dark"]
     return out
+
+
+# ---------------------------------------------------------------- the terminal UI
+
+NAMED = {"lime": 154, "cyan": 51, "yellow": 227, "red": 203, "magenta": 207, "orange": 214,
+         "grey": 244, "white": 255}
+BASIC = {"lime": 2, "cyan": 6, "yellow": 3, "red": 1, "magenta": 5, "orange": 3, "grey": 7, "white": 7}
 
 
 class App:
@@ -172,10 +330,15 @@ class App:
         self.scroll = 0
         self.buf, self.hist, self.hpos = "", [], 0
         self.lock = threading.Lock()
-        self.busy = False
+        self.active = None                       # the Shell running a command right now
+        self.busy_since = 0.0
         self.quit = False
         self.wake = threading.Event()
+        self.shells = {"android": Shell(self, "android", "sh"),
+                       "arch": Shell(self, "arch", f"{BASE}/arch.sh run sh")}
+        self.pairs = {}
 
+    # -- background pieces
     def poller(self):
         while not self.quit:
             st, err = fetch(self.host)
@@ -184,70 +347,176 @@ class App:
             self.wake.wait(self.interval)
             self.wake.clear()
 
-    def run_command(self, line):
-        remote = f"{BASE}/arch.sh run {shlex.quote(line[6:])}" if line.startswith("@arch ") else line
+    def add(self, line):
         with self.lock:
-            self.out.append(f"$ {line}")
-            self.busy = True
-        try:
-            p = subprocess.Popen(ssh_cmd(self.host, remote, 120), stdout=subprocess.PIPE,
-                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, errors="replace")
-            for l in p.stdout:
-                with self.lock:
-                    self.out.append(l.rstrip("\n").replace("\t", "    "))
-            rc = p.wait()
-            if rc:
-                with self.lock:
-                    self.out.append(f"[exit {rc}]")
-        except OSError as e:
-            with self.lock:
-                self.out.append(f"[failed: {e}]")
+            self.out.append(line)
+
+    def finish(self, shell):
         with self.lock:
-            self.busy = False
+            if self.active is shell:
+                self.active = None
         self.wake.set()
 
+    def submit(self, line):
+        if self.active:
+            self.add("[still running; Ctrl-C stops it]")
+            return
+        shell = self.shells["arch" if line.startswith("@arch") else "android"]
+        cmd = line[5:].strip() if shell.name == "arch" else line
+        self.add(f"{shell.name}:{shell.cwd}$ {cmd}")
+        with self.lock:
+            self.active, self.busy_since = shell, time.time()
+        try:
+            shell.run(cmd)
+        except (OSError, ValueError) as e:
+            self.add(f"[could not send: {e}]")
+            self.finish(shell)
+
+    def stop_running(self, why):
+        with self.lock:
+            sh, self.active = self.active, None
+        if sh:
+            sh.kill()
+            self.add(f"[{why}; the {sh.name} shell was dropped and starts fresh next time]")
+
+    # -- colors
+    def col(self, name):
+        if curses.COLORS >= 256:
+            return curses.color_pair(self.pair(NAMED[name], -1))
+        return curses.color_pair(self.pair(BASIC[name], -1)) | (curses.A_DIM if name == "grey" else 0)
+
+    def pair(self, fg, bg):
+        key = (fg, bg)
+        if key not in self.pairs:
+            n = len(self.pairs) + 1
+            if n >= curses.COLOR_PAIRS:
+                return 0
+            curses.init_pair(n, fg, bg)
+            self.pairs[key] = n
+        return self.pairs[key]
+
+    # -- drawing
     def draw(self, scr):
         h, w = scr.getmaxyx()
         scr.erase()
 
         def put(y, x, s, attr=0):
-            if 0 <= y < h and 0 <= x < w:
+            if 0 <= y < h and x < w:
                 try:
-                    scr.addnstr(y, x, s, max(0, w - x - (1 if y == h - 1 else 0)), attr)
+                    scr.addnstr(y, max(0, x), s[max(0, -x):], max(0, w - max(0, x) - (1 if y == h - 1 else 0)), attr)
                 except curses.error:
                     pass
 
-        with self.lock:
-            st, err, out = self.state, self.err, list(self.out)
-            busy = self.busy
-        m = mood(st, err)
-        col = curses.color_pair(MOOD_COLOR[m]) if curses.has_colors() else 0
-        age = f"updated {fmt_dur(time.time() - st['fetched'])} ago" if st else "no data"
-        put(0, 0, f" droidkibble  {self.host}  {age} ".ljust(w), curses.A_REVERSE)
+        def segs(y, x, pieces):
+            for text, color in pieces:
+                put(y, x, text, self.col(color))
+                x += len(text)
 
-        tick = int(time.time() * 1.5)
-        art = dog(m, tick)
-        for i, l in enumerate(art):
-            put(2 + i, 2, l, col | curses.A_BOLD)
-        for i, (t, c) in enumerate(stats(st, err)):
-            put(2 + i, 18 if w >= 70 else 2, t, curses.color_pair(c) if c and curses.has_colors() else 0)
-        top = 2 + max(len(art), len(stats(st, err))) + 1
-        put(top - 1, 0, "-" * w)
-        room = h - top - 2
+        if h < 18 or w < 60:
+            put(0, 0, "terminal too small (need about 60x18, 100x30 is nicer)")
+            scr.refresh()
+            return
+        with self.lock:
+            st, err, out, active = self.state, self.err, list(self.out), self.active
+        m = mood(st, err)
+        color256 = curses.COLORS >= 256
+        j = fresh_json(st)
+
+        # header
+        age = f"updated {fmt_dur(time.time() - st['fetched'])} ago" if st else "no data"
+        up = f"   UP {fmt_dur(j['uptime_s'])}" if j else ""
+        put(0, 0, " " * w, self.col("lime") | curses.A_REVERSE)
+        put(0, 1, "* DROIDKIBBLE *", self.col("lime") | curses.A_REVERSE | curses.A_BOLD)
+        info = f"{self.host}{up}   {age} "
+        put(0, max(18, w - len(info)), info, self.col("lime") | curses.A_REVERSE)
+
+        # the play field: everything above the bottom-third terminal
+        term_h = max(6, h // 3)
+        field_top, field_h = 1, h - term_h - 2
+        tick = int(time.time() * 2)
+        if color256:
+            spr, dw, dh = sprite(m, tick), PW, PH // 2
+        else:
+            art = ascii_dog(m, tick)
+            spr, dw, dh = None, len(art[0]), len(art)
+        cap, capcol = CAPTION[m]
+        dy = field_top + max(0, (field_h - dh - 2) // 2)
+        dx = (w - dw) // 2
+        if spr:
+            for r in range(dh):
+                for x in range(dw):
+                    top, bot = spr[2 * r][x], spr[2 * r + 1][x]
+                    if top is None and bot is None:
+                        continue
+                    if bot is None:
+                        put(dy + r, dx + x, "▀", curses.color_pair(self.pair(top, -1)))
+                    elif top is None:
+                        put(dy + r, dx + x, "▄", curses.color_pair(self.pair(bot, -1)))
+                    else:
+                        put(dy + r, dx + x, "▀", curses.color_pair(self.pair(top, bot)))
+            if m == "asleep":
+                put(dy + 1, dx + 31, "z" if tick % 2 else "Z", self.col("cyan") | curses.A_BOLD)
+                put(dy - 0, dx + 34, "Z" if tick % 2 else "z", self.col("cyan") | curses.A_BOLD)
+            elif m == "lost":
+                put(dy + 1, dx + 33, "?", self.col("red") | curses.A_BOLD)
+                put(dy + 0, dx + 36, "?" if tick % 2 else " ", self.col("red") | curses.A_BOLD)
+        else:
+            for i, l in enumerate(art):
+                put(dy + i, dx, l, self.col(capcol) | curses.A_BOLD)
+        put(dy + dh + 1, (w - len(cap)) // 2, cap, self.col(capcol) | curses.A_BOLD)
+
+        # side panels, or one stacked block under the dog when the window is narrow
+        side = dx - 2
+        left, right = panels(st, err, bw=max(8, min(14, side - 12)))
+        if side >= 24:
+            for (lines, x0, title, tc) in ((left, 1, " VITALS ", "cyan"), (right, dx + dw + 1, " LINK ", "magenta")):
+                pw = side - 1 if x0 == 1 else w - x0 - 1
+                put(dy, x0, "┌─" + title + "─" * max(0, pw - len(title) - 3) + "┐", self.col(tc))
+                nrows = min(len(lines), field_h - 2)
+                for i in range(nrows + 1):
+                    put(dy + 1 + i, x0, "│", self.col(tc))
+                    put(dy + 1 + i, x0 + pw - 1, "│", self.col(tc))
+                    if i < nrows:
+                        segs(dy + 1 + i, x0 + 2, lines[i])
+                put(dy + nrows + 1, x0, "└" + "─" * (pw - 2) + "┘", self.col(tc))
+        else:
+            y = dy + dh + 3
+            for line in left + right:
+                if y < field_top + field_h:
+                    segs(y, 2, line)
+                    y += 1
+
+        # terminal: the bottom third
+        sep = h - term_h - 1
+        shell = self.shells["arch" if self.buf.startswith("@arch") else "android"]
+        title = f" TERMINAL  {shell.name}:{shell.cwd} "
+        put(sep, 0, "━" * w, self.col("orange"))
+        put(sep, 2, title[:w - 4], self.col("orange") | curses.A_BOLD)
+        if active:
+            put(sep, max(len(title) + 4, w - 22), " running... Ctrl-C stops ", self.col("yellow") | curses.A_BOLD)
+        room = term_h - 1
         end = len(out) - self.scroll
         for i, l in enumerate(out[max(0, end - room):end]):
-            put(top + i, 1, l)
-        put(h - 2, 0, ("running... " if busy else "") + ("-" * (w - 11 if busy else w)))
-        put(h - 1, 0, "> " + self.buf, curses.A_BOLD)
+            first = l.split(" ", 1)[0]
+            attr = self.col("cyan") if first.endswith("$") else self.col("red") if l.startswith("[") else 0
+            put(sep + 1 + i, 1, l, attr)
+        prompt = f"{shell.name}> "
+        put(h - 1, 0, prompt, self.col("orange") | curses.A_BOLD)
+        put(h - 1, len(prompt), self.buf, curses.A_BOLD)
         try:
-            scr.move(h - 1, min(w - 2, 2 + len(self.buf)))
+            scr.move(h - 1, min(w - 2, len(prompt) + len(self.buf)))
         except curses.error:
             pass
         scr.refresh()
 
     def key(self, ch):
-        if ch in ("\x03", "\x04"):
+        if ch == "\x04":
             self.quit = True
+        elif ch == "\x03":
+            if self.active:
+                self.stop_running("stopped")
+            else:
+                self.quit = True
         elif ch in ("\n", "\r"):
             line, self.buf = self.buf.strip(), ""
             if line in (":q", ":quit"):
@@ -256,7 +525,7 @@ class App:
                 self.hist.append(line)
                 self.hpos = len(self.hist)
                 self.scroll = 0
-                threading.Thread(target=self.run_command, args=(line,), daemon=True).start()
+                self.submit(line)
         elif ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
             self.buf = self.buf[:-1]
         elif ch == "\x15":
@@ -268,40 +537,47 @@ class App:
             self.hpos = min(len(self.hist), self.hpos + 1)
             self.buf = self.hist[self.hpos] if self.hpos < len(self.hist) else ""
         elif ch == curses.KEY_PPAGE:
-            self.scroll = min(len(self.out), self.scroll + 8)
+            self.scroll = min(len(self.out), self.scroll + 5)
         elif ch == curses.KEY_NPAGE:
-            self.scroll = max(0, self.scroll - 8)
+            self.scroll = max(0, self.scroll - 5)
         elif isinstance(ch, str) and ch.isprintable():
             self.buf += ch
 
     def main(self, scr):
+        curses.raw()                              # so Ctrl-C arrives as a key, not a signal
         curses.curs_set(1)
         if curses.has_colors():
             curses.start_color()
             curses.use_default_colors()
-            for i, c in ((1, curses.COLOR_RED), (2, curses.COLOR_GREEN),
-                         (3, curses.COLOR_YELLOW), (4, curses.COLOR_CYAN)):
-                curses.init_pair(i, c, -1)
+        else:
+            curses.COLORS = 0
         scr.timeout(250)
         threading.Thread(target=self.poller, daemon=True).start()
         while not self.quit:
+            if self.active and time.time() - self.busy_since > CMD_TIMEOUT_S:
+                self.stop_running(f"no answer after {CMD_TIMEOUT_S} s")
             self.draw(scr)
             try:
                 self.key(scr.get_wch())
             except curses.error:
                 pass
+        for sh in self.shells.values():
+            sh.kill()
 
 
 def snapshot(host):
     st, err = fetch(host)
-    m = mood(st, err)
-    print("\n".join(dog(m, 0)))
-    print("\n".join(t for t, _ in stats(st, err)))
+    left, right = panels(st, err)
+    print("\n".join(ascii_dog(mood(st, err), 0)))
+    print(CAPTION[mood(st, err)][0])
+    for line in left + right:
+        if line:
+            print("".join(t for t, _ in line))
     return 0 if st else 1
 
 
 def main():
-    ap = argparse.ArgumentParser(description="terminal dashboard for a droidkibble phone")
+    ap = argparse.ArgumentParser(description="arcade-style terminal dashboard for a droidkibble phone")
     ap.add_argument("host", help="ssh host that logs in as root on the phone")
     ap.add_argument("--interval", type=float, default=5, help="seconds between updates (default 5)")
     ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
