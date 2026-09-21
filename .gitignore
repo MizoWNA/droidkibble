@@ -1,4 +1,1 @@
-.DS_Store
-*.swp
-*.tar.gz
-*.part
+__pycache__/

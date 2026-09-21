@@ -1,0 +1,318 @@
+#!/usr/bin/env python3
+"""kibble: a small terminal dashboard for a droidkibble phone.
+
+Shows battery, memory, network, DHCP and watchdog state, with a dog that tells you
+at a glance whether the watchdog is being fed. Type a command at the bottom and press
+Enter to run it on the phone.
+
+It only wraps ssh (key login, nothing stored). Python 3 standard library only.
+
+    kibble <ssh-host>            dashboard (an ssh host that logs in as root on the phone)
+    kibble <ssh-host> --once     print one snapshot and exit (also handy in scripts)
+
+In the dashboard:
+    <text> + Enter   run in the phone's Android root shell
+    @arch <text>     run inside the Arch chroot instead
+    Up / Down        command history          PgUp / PgDn   scroll the output
+    Ctrl-U           clear the line           Ctrl-C, Ctrl-D or :q   quit
+Programs that need a terminal (top, vim, ...) don't work; use ssh for those.
+"""
+import argparse
+import collections
+import curses
+import json
+import os
+import shlex
+import subprocess
+import sys
+import threading
+import time
+
+BASE = "/data/adb/phoneserver"
+POLL = (
+    f'D={BASE}; echo "now=$(date +%s)"; echo "zygote=$(getprop init.svc.zygote)"; '
+    f'echo "headless_flag=$([ -e $D/headless ] && echo 1 || echo 0)"; '
+    f'echo ---json; cat $D/status.json 2>/dev/null; echo; '
+    f'echo ---once; $D/phoneserverd --once 2>/dev/null'
+)
+FED_OK_S = 15          # the daemon feeds every 5 s; slower than this looks wrong
+STALE_S = 20           # status.json older than this is not from a running daemon
+
+
+def ssh_cmd(host, remote, timeout):
+    opts = ["-o", "BatchMode=yes", "-o", "ConnectTimeout=5", "-o", "ServerAliveInterval=5",
+            "-o", "ControlMaster=auto", "-o", "ControlPersist=120",
+            "-o", "ControlPath=" + os.path.expanduser("~/.cache/droidkibble/cm-%C")]
+    os.makedirs(os.path.expanduser("~/.cache/droidkibble"), exist_ok=True)
+    return ["timeout", str(timeout), "ssh", *opts, host, remote]
+
+
+def fetch(host):
+    """One round trip. Returns (state, error)."""
+    try:
+        p = subprocess.run(ssh_cmd(host, POLL, 15), capture_output=True, text=True, timeout=20)
+    except (subprocess.TimeoutExpired, OSError) as e:
+        return None, str(e)
+    if p.returncode != 0 and "now=" not in p.stdout:
+        lines = [l for l in p.stderr.splitlines() if l and not l.startswith("**")]
+        return None, (lines[-1] if lines else f"ssh exited {p.returncode}")
+    return parse(p.stdout), None
+
+
+def parse(out):
+    parts = {"head": [], "json": [], "once": []}
+    cur = "head"
+    for line in out.splitlines():
+        if line == "---json":
+            cur = "json"
+        elif line == "---once":
+            cur = "once"
+        else:
+            parts[cur].append(line)
+    st = dict(l.partition("=")[::2] for l in parts["head"] if "=" in l)
+    try:
+        st["json"] = json.loads("\n".join(parts["json"]))
+    except ValueError:
+        st["json"] = None
+    st["once"] = parts["once"]
+    st["fetched"] = time.time()
+    return st
+
+
+def fresh_json(st):
+    j = st and st.get("json")
+    try:
+        if j and abs(int(st["now"]) - int(j["time"])) <= STALE_S:
+            return j
+    except (KeyError, ValueError):
+        pass
+    return None
+
+
+def mood(st, err):
+    if st is None or err:
+        return "lost"
+    if st.get("zygote") == "running":
+        return "asleep"          # Android's own system_server feeds the watchdog
+    j = fresh_json(st)
+    if j and j["watchdog"]["open"] and j["watchdog"]["fed_ago_s"] <= FED_OK_S:
+        return "fed"
+    return "hungry"
+
+
+DOG = {
+    "fed": ["   __       ", " o(__)\\____ ", "  /     __)%s", " (_|_|--|_|  ", "  good boy   "],
+    "hungry": ["   __       ", " o(__)\\____ ", "  /     __)_", " (_|_|--|_|  ", " feed me! \\_/"],
+    "asleep": ["       %s   ", "   ___      ", " (_____)\\__ ", " (_|_|--|_|  ", "  sleeping   "],
+    "lost": ["  ?  __     ", " o(__)\\____ ", "  /     __)_", " (_|_|--|_|  ", " where is it "],
+}
+MOOD_COLOR = {"fed": 2, "hungry": 3, "asleep": 4, "lost": 1}
+
+
+def dog(m, tick):
+    art = DOG[m]
+    if m == "fed":
+        art = [l % ("~" if tick % 2 else "-") if "%s" in l else l for l in art]
+    elif m == "asleep":
+        art = [l % ("z" if tick % 2 else "Z") if "%s" in l else l for l in art]
+    return art
+
+
+def bar(pct, width=14):
+    pct = max(0, min(100, pct))
+    n = round(width * pct / 100)
+    return "[" + "#" * n + "-" * (width - n) + "]"
+
+
+def fmt_dur(s):
+    s = int(s)
+    if s < 90:
+        return f"{s}s"
+    if s < 5400:
+        return f"{s // 60}m"
+    return f"{s // 3600}h{(s % 3600) // 60:02d}m"
+
+
+def stats(st, err):
+    """Lines of (text, color) for the status block."""
+    if st is None:
+        return [(f"can't reach the phone: {err}", 1)]
+    j = fresh_json(st)
+    zy = st.get("zygote", "?")
+    mode = "Android UI on" if zy == "running" else "headless" if zy == "stopped" else f"zygote {zy}"
+    out = [(f"mode      {mode}" + ("  (headless flag set)" if st.get("headless_flag") == "1" else ""), 0)]
+    if j:
+        b, m, n, d, w = j["battery"], j["memory"], j["network"], j["dhcp"], j["watchdog"]
+        out.append((f"battery   {bar(b['percent'])} {b['percent']}%  {b['state']}  {b['temp_c']}C", 0))
+        used = m["used_mb"]; tot = m["total_mb"]
+        out.append((f"memory    {bar(100 * used // tot)} {used}/{tot} MB", 0))
+        out.append((f"network   {n['ip']} via {n['gateway']}  router {'ok' if n['gateway_reachable'] else 'DOWN ' + fmt_dur(n['down_for_s'])}",
+                    0 if n["gateway_reachable"] else 1))
+        if d["enabled"]:
+            out.append((f"dhcp      lease {fmt_dur(d['lease_s'])}, next renewal in {fmt_dur(d['next_renewal_in_s'])}"
+                        + (f", {d['naks']} NAK" if d["naks"] else ""), 0))
+        out.append((f"watchdog  {w['device']} fed {w['fed_ago_s']}s ago" if w["open"] else "watchdog  not held by the daemon",
+                    0 if w["open"] else 3))
+        s = j["services"]
+        out.append(("ssh       android " + ("up" if s["ssh_android_22"] else "DOWN")
+                    + ", chroot " + ("up" if s["ssh_chroot_2222"] else "DOWN"), 0))
+        out.append((f"phone up  {fmt_dur(j['uptime_s'])}", 0))
+    else:
+        out.append(("daemon    not running (fine while Android's UI is on)" if zy == "running"
+                    else "daemon    NOT RUNNING and the UI is off. Run ui.sh on", 0 if zy == "running" else 1))
+        out.extend((l, 0) for l in st["once"])
+    return out
+
+
+class App:
+    def __init__(self, host, interval):
+        self.host, self.interval = host, interval
+        self.state = self.err = None
+        self.out = collections.deque(maxlen=2000)
+        self.scroll = 0
+        self.buf, self.hist, self.hpos = "", [], 0
+        self.lock = threading.Lock()
+        self.busy = False
+        self.quit = False
+        self.wake = threading.Event()
+
+    def poller(self):
+        while not self.quit:
+            st, err = fetch(self.host)
+            with self.lock:
+                self.state, self.err = st, err
+            self.wake.wait(self.interval)
+            self.wake.clear()
+
+    def run_command(self, line):
+        remote = f"{BASE}/arch.sh run {shlex.quote(line[6:])}" if line.startswith("@arch ") else line
+        with self.lock:
+            self.out.append(f"$ {line}")
+            self.busy = True
+        try:
+            p = subprocess.Popen(ssh_cmd(self.host, remote, 120), stdout=subprocess.PIPE,
+                                 stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL, text=True, errors="replace")
+            for l in p.stdout:
+                with self.lock:
+                    self.out.append(l.rstrip("\n").replace("\t", "    "))
+            rc = p.wait()
+            if rc:
+                with self.lock:
+                    self.out.append(f"[exit {rc}]")
+        except OSError as e:
+            with self.lock:
+                self.out.append(f"[failed: {e}]")
+        with self.lock:
+            self.busy = False
+        self.wake.set()
+
+    def draw(self, scr):
+        h, w = scr.getmaxyx()
+        scr.erase()
+
+        def put(y, x, s, attr=0):
+            if 0 <= y < h and 0 <= x < w:
+                try:
+                    scr.addnstr(y, x, s, max(0, w - x - (1 if y == h - 1 else 0)), attr)
+                except curses.error:
+                    pass
+
+        with self.lock:
+            st, err, out = self.state, self.err, list(self.out)
+            busy = self.busy
+        m = mood(st, err)
+        col = curses.color_pair(MOOD_COLOR[m]) if curses.has_colors() else 0
+        age = f"updated {fmt_dur(time.time() - st['fetched'])} ago" if st else "no data"
+        put(0, 0, f" droidkibble  {self.host}  {age} ".ljust(w), curses.A_REVERSE)
+
+        tick = int(time.time() * 1.5)
+        art = dog(m, tick)
+        for i, l in enumerate(art):
+            put(2 + i, 2, l, col | curses.A_BOLD)
+        for i, (t, c) in enumerate(stats(st, err)):
+            put(2 + i, 18 if w >= 70 else 2, t, curses.color_pair(c) if c and curses.has_colors() else 0)
+        top = 2 + max(len(art), len(stats(st, err))) + 1
+        put(top - 1, 0, "-" * w)
+        room = h - top - 2
+        end = len(out) - self.scroll
+        for i, l in enumerate(out[max(0, end - room):end]):
+            put(top + i, 1, l)
+        put(h - 2, 0, ("running... " if busy else "") + ("-" * (w - 11 if busy else w)))
+        put(h - 1, 0, "> " + self.buf, curses.A_BOLD)
+        try:
+            scr.move(h - 1, min(w - 2, 2 + len(self.buf)))
+        except curses.error:
+            pass
+        scr.refresh()
+
+    def key(self, ch):
+        if ch in ("\x03", "\x04"):
+            self.quit = True
+        elif ch in ("\n", "\r"):
+            line, self.buf = self.buf.strip(), ""
+            if line in (":q", ":quit"):
+                self.quit = True
+            elif line:
+                self.hist.append(line)
+                self.hpos = len(self.hist)
+                self.scroll = 0
+                threading.Thread(target=self.run_command, args=(line,), daemon=True).start()
+        elif ch in ("\x7f", "\b", curses.KEY_BACKSPACE):
+            self.buf = self.buf[:-1]
+        elif ch == "\x15":
+            self.buf = ""
+        elif ch == curses.KEY_UP and self.hist:
+            self.hpos = max(0, self.hpos - 1)
+            self.buf = self.hist[self.hpos]
+        elif ch == curses.KEY_DOWN and self.hist:
+            self.hpos = min(len(self.hist), self.hpos + 1)
+            self.buf = self.hist[self.hpos] if self.hpos < len(self.hist) else ""
+        elif ch == curses.KEY_PPAGE:
+            self.scroll = min(len(self.out), self.scroll + 8)
+        elif ch == curses.KEY_NPAGE:
+            self.scroll = max(0, self.scroll - 8)
+        elif isinstance(ch, str) and ch.isprintable():
+            self.buf += ch
+
+    def main(self, scr):
+        curses.curs_set(1)
+        if curses.has_colors():
+            curses.start_color()
+            curses.use_default_colors()
+            for i, c in ((1, curses.COLOR_RED), (2, curses.COLOR_GREEN),
+                         (3, curses.COLOR_YELLOW), (4, curses.COLOR_CYAN)):
+                curses.init_pair(i, c, -1)
+        scr.timeout(250)
+        threading.Thread(target=self.poller, daemon=True).start()
+        while not self.quit:
+            self.draw(scr)
+            try:
+                self.key(scr.get_wch())
+            except curses.error:
+                pass
+
+
+def snapshot(host):
+    st, err = fetch(host)
+    m = mood(st, err)
+    print("\n".join(dog(m, 0)))
+    print("\n".join(t for t, _ in stats(st, err)))
+    return 0 if st else 1
+
+
+def main():
+    ap = argparse.ArgumentParser(description="terminal dashboard for a droidkibble phone")
+    ap.add_argument("host", help="ssh host that logs in as root on the phone")
+    ap.add_argument("--interval", type=float, default=5, help="seconds between updates (default 5)")
+    ap.add_argument("--once", action="store_true", help="print one snapshot and exit")
+    a = ap.parse_args()
+    if a.once or not sys.stdout.isatty():
+        sys.exit(snapshot(a.host))
+    try:
+        curses.wrapper(App(a.host, max(2, a.interval)).main)
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

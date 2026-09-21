@@ -66,7 +66,7 @@ On the next boot the phone waits until it's been up for 150 seconds and is on Wi
 
 Something has to replace the parts of Android that go away, so a small C program, `phoneserverd`, runs on the phone. It feeds the watchdog, renews the Wi-Fi DHCP lease, pings the router, and writes a status file and a log. If the router is unreachable for about five minutes it brings the UI back so Android can sort the network out itself. If two headless sessions in a row end early, headless mode turns itself off and the phone boots normally, so a bad build can't leave you with a screenless phone in a reset loop. More in [docs/daemon.md](docs/daemon.md).
 
-To see how it's doing: `ssh <phone-root> /data/adb/phoneserver/phoneserverd --status`
+To see how it's doing: `ssh <phone-root> /data/adb/phoneserver/phoneserverd --status`, or run `scripts/pc/kibble <ssh-host>` for a small terminal dashboard with a dog that shows whether the watchdog is being fed. You can also run commands on the phone from it ([docs/companion.md](docs/companion.md)).
 
 ## Getting the normal phone back
 
@@ -93,10 +93,10 @@ If your phone is supported by postmarketOS or Droidian, use one of those. They'r
 ## What's in the repo
 
 ```
-scripts/pc/       run on your computer: download, push, install, check for drift
+scripts/pc/       run on your computer: download, push, install, check for drift, kibble (dashboard)
 scripts/phone/    run on the phone: chroot manager, boot hook, headless on/off, pacman and AUR setup, diagnose.sh
 daemon/           phoneserverd, the C source
-docs/             setup, how it works, the daemon, troubleshooting, alternatives
+docs/             setup, how it works, the daemon, the dashboard, troubleshooting, alternatives
 extras/           optional extras, like a matching shell for the phone
 CHANGELOG.md      changes, and what's been verified on hardware
 ```

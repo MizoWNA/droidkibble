@@ -6,6 +6,7 @@ verified on real hardware is marked as such.
 ## 0.1.0 (first public version)
 
 ### Added
+- `scripts/pc/kibble`: a terminal dashboard (Python, standard library only) showing battery, memory, network, DHCP and watchdog state, with a dog that shows whether the watchdog is being fed, and a command line that runs commands on the phone (Android shell, or `@arch` for the chroot). See `docs/companion.md`. Tested on Linux against the Galaxy A30 in headless mode; the other dog moods, macOS and tiny terminals are untested.
 - Project name is now droidkibble (was the working title phone-server). The on-phone paths (`/data/adb/phoneserver/`) are unchanged.
 - Issue templates in `.github/ISSUE_TEMPLATE/`: a device report and a bug form, both asking for `diagnose.sh` output.
 - `LICENSE` (MIT).
