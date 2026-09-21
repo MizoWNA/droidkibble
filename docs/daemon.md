@@ -51,7 +51,7 @@ I've only tried this against my own router, which accepted the request and hande
 - **The daemon crashes.** `ui.sh` runs it inside a small loop that restarts it within a second, well inside the watchdog window.
 - **Both die.** The watchdog resets the phone in about a minute. After a reset it boots normally and headless mode starts again.
 - **The daemon is unstable.** A headless session only counts as healthy after 10 minutes. If two sessions in a row end before that, headless mode blocks itself (`/data/adb/phoneserver/headless.blocked`) and the phone boots with the normal Android UI, so a bad build can't leave you with a screenless phone stuck in a reset loop. Delete that file to try again.
-- **The router goes away.** After 5 minutes the UI comes back on its own. That also happens if the DHCP server keeps refusing the address.
+- **The router goes away.** After 5 minutes the UI comes back on its own. That also happens if the DHCP server keeps refusing the address. I've seen this work for real: I carried the phone out of range of my router while headless, and about five minutes later the UI came back and Android joined a different network. Android only auto-joins networks it already has saved, so at a new place you add the network on the screen (or with adb, see [troubleshooting.md](troubleshooting.md)).
 - **You run `ui.sh on` yourself.** That's a deliberate stop; it doesn't count against the stability check.
 
 ## Files it uses (in `/data/adb/phoneserver/`)

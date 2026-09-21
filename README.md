@@ -80,6 +80,7 @@ Nothing here touches the Android system partition. Deleting `/data/adb/service.d
 ## What doesn't work yet
 
 - **Long runs.** The longest continuous headless run so far is well under an hour, plus a couple of unattended reboots. I haven't run it for days.
+- **Moving to another network** while headless works only through the fallback: after about five minutes without the router the Android UI comes back and you add the new Wi-Fi on the screen. I've watched it work once. There is no way to join a new Wi-Fi while headless.
 - **DHCP renewal** works against my router. Others may behave differently, and a DHCP reservation is still the safest setup.
 - **The screen stays dark.** I'd like to show battery and status on it, but this phone's framebuffer can't be drawn to directly. It would need Samsung's private display path. My notes are in [how-it-works.md](docs/how-it-works.md#drawing-on-the-screen-investigation-not-working-yet).
 - **No systemd** in the chroot. The 4.x kernel is too old, so services are plain scripts.

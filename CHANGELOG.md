@@ -37,6 +37,7 @@ verified on real hardware is marked as such.
   `/data` is mounted `nosuid` on Android, which broke `sudo` for non-root users.
 
 ### Verified on hardware (Galaxy A30, Android 11, kernel 4.4)
+- Leaving the router's range while headless: the daemon logged `network down`, and 5 min 8 s later restored the Android UI (`restoring the Android UI: router unreachable for too long`), released the watchdog and stopped. The phone did not reset, stayed up, and Android was usable on a different network afterwards. Seen once, on one phone.
 - `scripts/pc/install.sh` deployed to the phone, then a reboot: the chroot, its sshd and
   headless mode all came back from the installed paths.
 - `setup-pacman.sh` (run twice) and `setup-aur.sh` (run on an already configured chroot, so it
