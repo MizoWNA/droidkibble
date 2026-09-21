@@ -9,6 +9,9 @@ verified on real hardware is marked as such.
 - `scripts/pc/kibble`, a terminal dashboard (Python, standard library only). A pixel dog shows whether the watchdog is being fed, with battery, memory, network, DHCP and watchdog details around it. The bottom third is a persistent shell on the phone, either the Android root shell or the Arch chroot (Tab switches, each keeps its own directory). While a command runs, what you type goes to it, so prompts like pacman's `[Y/n]` can be answered. F5 and F6 switch headless mode on and off, now and at boot. See `docs/companion.md`.
 - kibble finds the phone on any network by its SSH host key, with a scan-and-login screen when it can't (`kibble`, `:connect`), plus `kibble learn`, `find` and `connect`. `kibble ssh-config --install` adds a `ProxyCommand` to `~/.ssh/config` so plain `ssh`, `scp` and `phonessh` follow the phone from network to network. Password login is written but untested.
 
+### Prototype (not wired in yet)
+- `display/`: a small Java program (`dk.Status`) that draws the phone's status on the screen through SurfaceFlinger, run with `app_process` while the UI is off. `scripts/pc/get-display-tools.sh` downloads the JDK, d8 and android.jar it is built with (about 260 MB, into `~/.local/droidkibble-sdk`). Seen working in a `screencap` screenshot; not yet confirmed on the physical panel. About 98 MB of RAM while running.
+
 ### Fixed
 - `scripts/phone/diagnose.sh` took minutes with the UI running (it started a `readlink` for every file descriptor of every process). It now uses one `ls` and takes about 2 seconds. I only found this by running it with the normal UI up; the headless run had been fast.
 

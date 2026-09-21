@@ -88,7 +88,10 @@ A chroot on Android shares the phone's kernel, and Android's kernel and mount op
 | `pacman` sandbox errors | the download sandbox needs kernel features 4.x doesn't have | `DisableSandbox` in `pacman.conf` |
 | a full `pacman -Syu` wants ~400 MB | most of it is a kernel and PC hardware firmware that does nothing in a chroot | remove them (`setup-pacman.sh --drop-kernel`): upgrade shrinks to ~60 MB, and ~1.3 GB of disk comes back |
 
-## Drawing on the screen (investigation, not working yet)
+## Drawing on the screen
+
+**Update:** there is a working route that doesn't need any of the display-driver work described further down. SurfaceFlinger and the hardware composer keep running in headless mode, so a small Java program run with `app_process` can ask SurfaceFlinger for a layer and draw on it with ordinary Canvas calls. It needs no `system_server`, and it draws through the same path Android's own UI uses, so none of the driver structures below have to be guessed. `display/` has the prototype (`Status.java`, `build.sh`, and `run.sh` for the phone). Checked so far: it starts, creates the layer, and a `screencap` screenshot of SurfaceFlinger's output shows the status text and bars, updating each second. It uses about 98 MB of RAM while running. Not yet checked: that the picture is visible on the physical panel (I could only look at the screenshot), and how it behaves over hours. The rest of this section is what I found before I knew about this route.
+
 
 With the Android UI off the screen is dark, and it would be useful to show status on it. The findings so far, all from the Galaxy A30:
 
