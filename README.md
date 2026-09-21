@@ -27,7 +27,7 @@ The chroot and SSH parts shouldn't care much about the model. Headless mode is t
 ssh <phone-root> sh -s < scripts/phone/diagnose.sh
 ```
 
-It prints the model, Android and kernel versions, which watchdog devices exist and which processes hold them. If you try this on another phone, I'd like to hear how it went, whether it worked or not. Open an issue and paste that output.
+It prints the model, Android and kernel versions, which watchdog devices exist and which processes hold them. If you try this on another phone, I'd like to hear how it went, whether it worked or not. Open an issue and paste that output. What's been tried so far is in [docs/compatibility.md](docs/compatibility.md).
 
 ## Setting it up
 
@@ -96,7 +96,7 @@ If your phone is supported by postmarketOS or Droidian, use one of those. They'r
 scripts/pc/       run on your computer: download, push, install, check for drift, kibble (dashboard)
 scripts/phone/    run on the phone: chroot manager, boot hook, headless on/off, pacman and AUR setup, diagnose.sh
 daemon/           phoneserverd, the C source
-docs/             setup, how it works, the daemon, the dashboard, troubleshooting, alternatives
+docs/             setup, how it works, the daemon, the dashboard, troubleshooting, alternatives, compatibility
 extras/           optional extras, like a matching shell for the phone
 CHANGELOG.md      changes, and what's been verified on hardware
 ```
