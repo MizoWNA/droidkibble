@@ -82,7 +82,7 @@ Nothing here touches the Android system partition. Deleting `/data/adb/service.d
 - **Long runs.** The longest continuous headless run so far is well under an hour, plus a couple of unattended reboots. I haven't run it for days.
 - **Moving to another network** while headless works only through the fallback: after about five minutes without the router the Android UI comes back and you add the new Wi-Fi on the screen. I've watched it work once. There is no way to join a new Wi-Fi while headless.
 - **DHCP renewal** works against my router. Others may behave differently, and a DHCP reservation is still the safest setup.
-- **The screen stays dark.** I'm working on showing battery and status on it. A prototype that draws through SurfaceFlinger works in a screenshot but I haven't confirmed it on the panel yet, and it isn't wired into the daemon. My notes are in [how-it-works.md](docs/how-it-works.md#drawing-on-the-screen).
+- **The screen stays dark.** There's a working status screen (a letterpress-style ticket, see [display/](display/)) that draws through SurfaceFlinger, but you start it by hand for now and the daemon doesn't manage it yet. My notes on how I got there are in [how-it-works.md](docs/how-it-works.md#drawing-on-the-screen).
 - **No systemd** in the chroot. The 4.x kernel is too old, so services are plain scripts.
 - **No `ping`** inside the chroot (no raw sockets). Everything else, `curl` included, works.
 - **Mirrors time out at random** on a phone connection. `setup-pacman.sh` copes, but expect the odd ten-second pause.

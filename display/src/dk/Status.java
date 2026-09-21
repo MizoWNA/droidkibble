@@ -1,39 +1,47 @@
 package dk;
 
 import android.graphics.Canvas;
-import android.graphics.Color;
-import android.graphics.Paint;
 import android.graphics.PixelFormat;
-import android.graphics.Typeface;
 import android.view.Surface;
 import android.view.SurfaceControl;
 
-import org.json.JSONObject;
-
-import java.io.BufferedReader;
-import java.io.FileReader;
 import java.lang.reflect.Method;
+import java.util.ArrayList;
+import java.util.Calendar;
+import java.util.List;
 
 /**
- * Paints the phone's status on the screen while the Android UI is off.
+ * Paints pages on the screen while the Android UI is off.
  *
  * SurfaceFlinger and the hardware composer keep running in headless mode, so this only has to ask
  * SurfaceFlinger for a layer and draw on it. It runs under app_process, needs no system_server, and
- * reads /data/adb/phoneserver/status.json, which phoneserverd keeps up to date.
+ * reads what phoneserverd writes (see Data).
  *
- *   status.jar [--seconds N] [--status FILE]
+ *   status.jar [--theme paper|night] [--interval SECONDS] [--seconds N] [--status FILE] [--extras DIR]
+ *
+ * With several pages they take turns, PAGE_SECONDS each. To add a page, implement Page and add it below.
  */
 public class Status {
-    static final int W = 1080, H = 2340;
-    static final String LIME = "#dfff4f";
+    static final int W = 1080, H = 2340, PAGE_SECONDS = 20;
 
     public static void main(String[] args) throws Exception {
         long endAt = Long.MAX_VALUE;
-        String file = "/data/adb/phoneserver/status.json";
+        String status = "/data/adb/phoneserver/status.json", extras = "/data/adb/phoneserver/display.d";
+        String theme = "paper";
+        int interval = 5;
         for (int i = 0; i < args.length - 1; i++) {
-            if (args[i].equals("--seconds")) endAt = System.currentTimeMillis() + Long.parseLong(args[i + 1]) * 1000;
-            if (args[i].equals("--status")) file = args[i + 1];
+            switch (args[i]) {
+                case "--seconds": endAt = System.currentTimeMillis() + Long.parseLong(args[i + 1]) * 1000; break;
+                case "--status": status = args[i + 1]; break;
+                case "--extras": extras = args[i + 1]; break;
+                case "--theme": theme = args[i + 1]; break;
+                case "--interval": interval = Integer.parseInt(args[i + 1]); break;
+            }
         }
+        Theme th = Theme.byName(theme);
+        Data data = new Data(status, extras);
+        List<Page> pages = new ArrayList<>();
+        pages.add(new TicketPage());
 
         SurfaceControl sc = new SurfaceControl.Builder()
                 .setName("droidkibble").setBufferSize(W, H).setFormat(PixelFormat.RGBA_8888).build();
@@ -46,74 +54,29 @@ public class Status {
         }
         t.setLayer(sc, Integer.MAX_VALUE).setVisibility(sc, true).apply();
         Surface surface = new Surface(sc);
-        System.out.println("layer created, drawing");
+        System.out.println("layer created, theme " + th.name + ", " + pages.size() + " page(s)");
 
-        int n = 0;
         while (System.currentTimeMillis() < endAt) {
+            long now = System.currentTimeMillis();
+            data.refresh();
+            Page page = pages.get((int) (now / 1000 / PAGE_SECONDS) % pages.size());
+            // nudge the picture a few pixels every few minutes so nothing sits on the same pixels for days
+            Calendar cal = Calendar.getInstance();
+            int m = cal.get(Calendar.MINUTE);
+            float dx = (m % 5 - 2) * 3, dy = (m / 5 % 3 - 1) * 3;
             Canvas c = surface.lockCanvas(null);
             try {
-                draw(c, readJson(file), n++);
+                c.translate(dx, dy);
+                page.draw(new Page.Ctx(c, W, H, th, data, now));
+            } catch (Throwable e) {
+                System.err.println("draw failed: " + e);
+                e.printStackTrace();
             } finally {
                 surface.unlockCanvasAndPost(c);
             }
-            Thread.sleep(1000);
+            Thread.sleep(interval * 1000L);
         }
         surface.release();
         sc.release();
-    }
-
-    static JSONObject readJson(String file) {
-        try (BufferedReader r = new BufferedReader(new FileReader(file))) {
-            StringBuilder sb = new StringBuilder();
-            for (String l; (l = r.readLine()) != null; ) sb.append(l);
-            return new JSONObject(sb.toString());
-        } catch (Exception e) {
-            return null;
-        }
-    }
-
-    static void draw(Canvas c, JSONObject j, int tick) throws Exception {
-        c.drawColor(Color.parseColor("#0c0c10"));
-        Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
-        p.setTypeface(Typeface.MONOSPACE);
-
-        p.setColor(Color.parseColor(LIME));
-        p.setTextSize(64);
-        c.drawText("* DROIDKIBBLE *", 60, 160, p);
-        p.setColor(Color.GRAY);
-        p.setTextSize(40);
-        c.drawText("frame " + tick + "   " + new java.util.Date(), 60, 230, p);
-
-        if (j == null) {
-            p.setColor(Color.RED);
-            p.setTextSize(56);
-            c.drawText("no status.json", 60, 400, p);
-            return;
-        }
-        JSONObject b = j.getJSONObject("battery"), n = j.getJSONObject("network"), w = j.getJSONObject("watchdog");
-        int pct = b.getInt("percent");
-
-        p.setColor(pct < 20 ? Color.RED : Color.parseColor(LIME));
-        p.setTextSize(300);
-        c.drawText(pct + "%", 60, 640, p);
-        p.setColor(Color.parseColor("#2a2a32"));
-        c.drawRect(60, 700, 1020, 760, p);
-        p.setColor(pct < 20 ? Color.RED : Color.parseColor(LIME));
-        c.drawRect(60, 700, 60 + 960f * pct / 100f, 760, p);
-
-        p.setColor(Color.WHITE);
-        p.setTextSize(52);
-        int y = 900;
-        String[] lines = {
-            b.getString("state") + "  " + b.getDouble("temp_c") + " C",
-            "ip   " + n.getString("ip"),
-            "gw   " + n.getString("gateway") + (n.getBoolean("gateway_reachable") ? "  ok" : "  DOWN"),
-            "wdog " + w.getString("device") + "  fed " + w.getInt("fed_ago_s") + "s",
-            "up   " + j.getInt("uptime_s") / 60 + " min",
-        };
-        for (String l : lines) {
-            c.drawText(l, 60, y, p);
-            y += 90;
-        }
     }
 }
