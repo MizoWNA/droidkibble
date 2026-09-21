@@ -1,5 +1,5 @@
 #!/system/bin/sh
-# ui.sh off|on|status
+# ui.sh off|on|restart|status
 #
 # off: stop the Android framework to free RAM, then start phoneserverd, which takes over the jobs the
 #      framework did (feeding the second hardware watchdog, renewing the DHCP lease, watching the
@@ -7,6 +7,8 @@
 #      If the phoneserverd binary isn't installed, a plain BusyBox watchdog feeder is used instead.
 # on:  stop the daemon (or the fallback feeder), then restart the framework. system_server opens the
 #      watchdog again by itself.
+#
+# restart: restart only the daemon (headless mode stays on). Use it to apply changes to display.conf.
 #
 # Optional settings for the on-screen display go in /data/adb/phoneserver/display.conf (shell syntax):
 #   DISPLAY_THEME=paper       paper or night
@@ -79,8 +81,12 @@ case "$1" in
     echo phoneserver > /sys/power/wake_unlock 2>/dev/null
     setprop ctl.start zygote; setprop ctl.start zygote_secondary
     ;;
+  restart)
+    [ "$(getprop init.svc.zygote)" = "stopped" ] || { echo "not headless (the Android UI is running); nothing to restart"; exit 1; }
+    stop_daemon; start_daemon
+    ;;
   status)
     echo "zygote=$(getprop init.svc.zygote) daemon=$(daemon_alive && echo "running pid $(daemon_pid)" || echo stopped) fallback_feeder=$(cat $FEEDPID 2>/dev/null)"
     ;;
-  *) echo "usage: $0 off|on|status" ;;
+  *) echo "usage: $0 off|on|restart|status" ;;
 esac

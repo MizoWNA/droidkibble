@@ -3,27 +3,85 @@
 Newest first. Each entry says what changed and, where it matters, why. Anything that isn't
 verified on real hardware is marked as such.
 
-## Unreleased (after 0.1.0)
+## 1.0.0 (2026-09-21)
+
+The whole thing now works end to end on the test phone: boot, headless mode with the supervisor, a dashboard on your computer, and a status screen on the phone itself. "1.0" means that, on one phone. It does not mean it has been run for weeks; see the limits in the README.
 
 ### Added
-- `scripts/pc/kibble`, a terminal dashboard (Python, standard library only). A pixel dog shows whether the watchdog is being fed, with battery, memory, network, DHCP and watchdog details around it. The bottom third is a persistent shell on the phone, either the Android root shell or the Arch chroot (Tab switches, each keeps its own directory). While a command runs, what you type goes to it, so prompts like pacman's `[Y/n]` can be answered. F5 and F6 switch headless mode on and off, now and at boot. See `docs/companion.md`.
-- kibble finds the phone on any network by its SSH host key, with a scan-and-login screen when it can't (`kibble`, `:connect`), plus `kibble learn`, `find` and `connect`. `kibble ssh-config --install` adds a `ProxyCommand` to `~/.ssh/config` so plain `ssh`, `scp` and `phonessh` follow the phone from network to network. Password login is written but untested.
+- The on-screen display is part of `phoneserverd` now (the daemon reports 1.0.0). In headless mode the screen starts dark. Press the power button and it lights up with the status ticket; press again, or wait for the auto-off timer (10 minutes by default), and it goes dark. The daemon finds the power key by capability instead of by device number, owns the backlight, and stops the display if the display program dies.
+- `ui.sh` reads an optional `display.conf` (`DISPLAY_THEME`, `DISPLAY_BRIGHTNESS`, `DISPLAY_TIMEOUT`), `ui.sh restart` restarts just the daemon to apply it, and `ui.sh on` removes any leftover display so its layer never sits on top of Android.
+- `status.json` has a `display` block. `install.sh` and `check-sync.sh` handle the display files. kibble shows the screen state.
+- Details are in `docs/daemon.md` and `display/README.md`.
 
-### On-screen display
-- `phoneserverd` 0.2 runs the display and reads the power button. The screen starts dark in headless mode; a press lights it and starts the display program, another press (or the auto-off timer, 10 minutes by default) turns it off. It finds the power key by capability, not by device number. `status.json` gained a `display` block, `ui.sh` reads an optional `display.conf` (theme, brightness, timeout), `ui.sh on` removes any leftover display, and `install.sh` and `check-sync.sh` handle the display files. Details in `docs/daemon.md`.
-- `display/`: a small Java program that draws the phone's status on the screen through SurfaceFlinger while the UI is off. It has a tiny framework (pages, a data bus that also reads extra JSON files, themes, a drawing toolkit) and one page, a letterpress-style status ticket, in a paper theme and an OLED-friendly night theme. `scripts/pc/get-display-tools.sh` downloads the JDK, d8 and android.jar it is built with (about 260 MB, into `~/.local/droidkibble-sdk`). See `display/README.md`.
-- Checked on the Galaxy A30: the first prototype was seen on the physical panel, and the ticket page is confirmed in `screencap` screenshots of SurfaceFlinger's output in both themes. It uses about 100 MB of RAM. With the daemon: a simulated power press (a key event written into the input device) turns the screen on and off, the auto-off timer works, a killed display program turns the screen off, `ui.sh on` with the screen lit leaves nothing behind, and `ui.sh off` picks up `display.conf`. Not checked: a real press of the physical button, battery cost, runs of many hours, other phones.
+### Verified on hardware (Galaxy A30)
+- The physical power button turns the screen on and off.
+- With key events written into the input device: on and off, the auto-off timer, a killed display program turning the screen off, `ui.sh on` with the screen lit leaving nothing behind, and `ui.sh off` picking up `display.conf`.
+
+### Not verified
+- Battery cost of the screen, and runs of many hours or days.
+- Any phone other than the Galaxy A30.
+
+## 0.6.0 (2026-09-21)
+
+### Added
+- A proper look for the display: a letterpress-style status ticket with a ruled grid, a perforation, and a stub whose big word says FED, HUNGRY or LOST, plus a round stamp with a dog in it. Two themes: paper (cream, blue ink, gold) and night (cream on navy over pure black, for the OLED).
+- A small framework under it (`display/`): pages, a data bus that reads `status.json` and any other JSON file dropped into a directory, themes, and a drawing toolkit. The picture shifts a few pixels every few minutes to avoid burn-in. See `display/README.md`.
+
+### Verified on hardware
+- Both themes render correctly in `screencap` screenshots of SurfaceFlinger's output. The first plain-text prototype (0.5.0) had been seen on the physical panel. About 100 MB of RAM while running.
+
+## 0.5.0 (2026-09-21)
+
+### Added
+- `display/`: the first working way to draw on the screen while the Android UI is off. A small Java program run with `app_process` asks SurfaceFlinger for a layer and paints on it, with no framework and no kernel display code. `scripts/pc/get-display-tools.sh` downloads the JDK, d8 and android.jar to build it (about 260 MB, into `~/.local/droidkibble-sdk`). Started by hand with `display/run.sh`.
+
+### Verified on hardware
+- Seen on the physical panel, and in a `screencap` of SurfaceFlinger's output.
+
+## 0.4.1 (2026-09-21)
 
 ### Fixed
-- `scripts/phone/diagnose.sh` took minutes with the UI running (it started a `readlink` for every file descriptor of every process). It now uses one `ls` and takes about 2 seconds. I only found this by running it with the normal UI up; the headless run had been fast.
+- kibble's shell hid prompts that have no trailing newline, and gave commands no input, so `pacman -S` waited forever at "Proceed with installation? [Y/n]" and could not be answered. Output without a newline now shows immediately, and what you type while a command runs goes to it.
+- Ctrl-C used to drop the whole shell session, which could leave pacman's lock file behind. It now interrupts the command (SIGINT, then SIGTERM) and keeps the shell and its directory. The fixed two-minute command timeout is gone.
+- Rewrote `docs/companion.md`.
+
+### Verified on hardware
+- Answering `pacman -S neovim` with `n` in the chroot, and pressing Ctrl-C at its prompt: pacman exited and its lock was released both times.
+
+## 0.4.0 (2026-09-21)
+
+### Added
+- kibble finds the phone on any network by its SSH host key, with a scan-and-login screen when it can't (`kibble`, `:connect`), plus `kibble learn`, `find` and `connect`. `kibble ssh-config --install` adds a `ProxyCommand` to `~/.ssh/config` so plain `ssh`, `scp` and `phonessh` follow the phone from network to network. Password login is written but untested.
+- Tab switches between the Android shell and the Arch chroot, the command line has real cursor editing, `clear` and Ctrl-L clear the output, and F5 and F6 switch headless mode on and off, now and at boot.
+
+### Fixed
+- The watchdog age in the dashboard always read 0, because the status file is rewritten right after each feed. It now counts up between updates.
+
+### Verified on hardware
+- The scan and login screen on a real network, finding the phone again after a wrong address was cached (about six seconds), `ssh` and `phonessh` following it through the ProxyCommand, and going from headless to Android and back with F5.
+
+## 0.3.0 (2026-09-21)
+
+### Changed
+- kibble's shell is a real session now, so `cd` and variables carry over from one command to the next (before, every command was a separate `ssh`). The Android shell and the Arch chroot each have their own.
+- kibble got its arcade look: a pixel-art dog in the middle, battery and memory on its left, network, DHCP and watchdog on its right, colors throughout, and the terminal limited to the bottom third of the window.
+
+## 0.2.0 (2026-09-21)
+
+### Added
+- `scripts/pc/kibble`, a terminal dashboard for the phone (Python, standard library only): battery, memory, network, DHCP and watchdog state, an ASCII dog that shows whether the watchdog is being fed, and a command line that runs commands on the phone. See `docs/companion.md`.
+
+## 0.1.1 (2026-09-21)
+
+### Fixed
+- `scripts/phone/diagnose.sh` took minutes with the UI running, because it started a `readlink` for every file descriptor of every process. It now uses one `ls` and takes about 2 seconds. I only found this by running it with the normal UI up; the headless run had been fast.
 
 ### Verified on hardware (Galaxy A30)
 - Carrying the phone out of range of the router while headless: the daemon logged `network down` and, 5 min 8 s later, restored the Android UI (`router unreachable for too long`). The phone did not reset. Seen once.
 - Going headless on a second network (a cafe router on another subnet): the daemon found the new gateway and the router renewed the lease for 24 hours.
 - `diagnose.sh` with the UI running shows `system_server` holding `/dev/watchdog1` and `watchdogd` holding `/dev/watchdog`.
-- kibble: shells that keep their directory, answering `pacman -S` prompts from the chroot, Ctrl-C stopping commands and letting pacman release its lock, headless on and off from F5, and re-finding the phone after it changed address. Details and gaps are in `docs/companion.md`.
 
-## 0.1.0 (first public version)
+## 0.1.0 (2026-09-21, first public version)
 
 ### Added
 - Project name is now droidkibble (was the working title phone-server). The on-phone paths (`/data/adb/phoneserver/`) are unchanged.

@@ -20,7 +20,7 @@ Checked on the Galaxy A30: it starts, both themes render correctly in a `screenc
 scripts/pc/get-display-tools.sh      # once: JDK 17, d8 and android.jar into ~/.local/droidkibble-sdk (about 260 MB)
 display/build.sh                     # makes display/build/status.jar
 scripts/pc/install.sh <ssh-host>     # copies status.jar and run.sh to /data/adb/phoneserver/display/
-scripts/pc/build-daemon.sh <ssh-host>   # the daemon (0.2 or newer) is what reads the power button
+scripts/pc/build-daemon.sh <ssh-host>   # the daemon (1.0.0 or newer) is what reads the power button
 ```
 
 Then go headless (`ui.sh off`) and press the power button. Settings (theme, brightness, timeout) are in `display.conf`; see [docs/daemon.md](../docs/daemon.md#the-screen-and-the-power-button).

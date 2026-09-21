@@ -38,7 +38,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "0.2"
+#define VERSION "1.0.0"
 
 /* ---- tuning ------------------------------------------------------------------------------ */
 #define WDT_FEED_EVERY_S      5      /* how often to pet the watchdog */

@@ -92,4 +92,4 @@ DISPLAY_BRIGHTNESS=120     # backlight level while it's on; the panel's maximum 
 DISPLAY_TIMEOUT=600        # seconds until it turns itself off; 0 = stay on
 ```
 
-It's read when headless mode starts (`ui.sh off`, or a boot), not while the daemon is running.
+It's read when the daemon starts (`ui.sh off`, a boot, or `ui.sh restart`), not while it's running. After editing it, run `ssh <phone-root> /data/adb/phoneserver/ui.sh restart` to apply the change without leaving headless mode. Deleting the file has no effect until the daemon restarts either.

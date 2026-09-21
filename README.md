@@ -2,7 +2,7 @@
 
 *Feed the watchdog, free the RAM.*
 
-Scripts for turning an old rooted Android phone into a small always-on Linux server. It boots, joins your Wi-Fi, and you can SSH into a proper Arch Linux ARM system running on it. If you want, it can also shut the Android UI off to free up RAM.
+Scripts for turning an old rooted Android phone into a small always-on Linux server. Current version: 1.0.0 (see [CHANGELOG.md](CHANGELOG.md)), tested on one phone. It boots, joins your Wi-Fi, and you can SSH into a proper Arch Linux ARM system running on it. If you want, it can also shut the Android UI off to free up RAM.
 
 I built it to host a personal web app on a Galaxy A30 that was otherwise in a drawer. The phone had 4 GB of RAM and Android was eating more than half of it, so I wanted Android gone. Stopping the UI is one command. Keeping the phone alive afterwards took most of an evening, because it reset itself about 100 seconds later, every time. The reason is a second hardware watchdog that Samsung's system_server feeds (hence the name: the watchdog needs its kibble), and it's written up in [docs/how-it-works.md](docs/how-it-works.md) in case you hit the same thing.
 
