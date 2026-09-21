@@ -71,4 +71,4 @@ I've only tried this against my own router, which accepted the request and hande
 
 ## Drawing on the screen
 
-Not implemented. The daemon builds the same few status lines it logs (battery, memory, network, services) and hands them to an empty `display_update()`. Putting them on the panel needs Samsung's ION + display-driver path, described in [how-it-works.md](how-it-works.md#drawing-on-the-screen).
+Not wired in yet (see the prototype in `display/`). The daemon builds the same few status lines it logs (battery, memory, network, services) and hands them to an empty `display_update()`. Putting them on the panel needs Samsung's ION + display-driver path, described in [how-it-works.md](how-it-works.md#drawing-on-the-screen).
