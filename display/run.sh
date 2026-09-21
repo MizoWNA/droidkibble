@@ -7,6 +7,10 @@ D="$(cd "$(dirname "$0")" && pwd)"
 P=$(pidof surfaceflinger) || { echo "surfaceflinger is not running" >&2; exit 1; }
 eval "$(tr '\0' '\n' < /proc/$P/environ | grep -E '^(ANDROID_|BOOTCLASSPATH|DEX2OATBOOTCLASSPATH|SYSTEMSERVERCLASSPATH|ASEC_MOUNTPOINT)' | sed 's/^/export /')"
 export CLASSPATH="$D/status.jar"
+# phoneserverd sets NO_BACKLIGHT and looks after the backlight itself. Run by hand, we do it here.
+if [ -n "$NO_BACKLIGHT" ]; then
+  exec app_process /system/bin dk.Status "$@"
+fi
 B=/sys/class/backlight/panel/brightness
 echo "${BRIGHTNESS:-120}" > $B
 trap 'echo 0 > $B' EXIT

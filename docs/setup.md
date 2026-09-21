@@ -101,6 +101,8 @@ A few things to know before you turn it on:
 - Keep USB debugging on. If something goes badly wrong, `adb` over a cable is your way back in.
 - If the phone gets stuck, holding power and volume-down for about ten seconds forces a reboot. With the flag file removed it will come up with the normal Android UI.
 
+Optionally, build and install the on-screen display too, so the power button can show a status screen. That's a separate download of about 260 MB (a JDK and the Android dex tools), described in [display/README.md](../display/README.md).
+
 ## 7. Make pacman work properly
 
 Out of the box, `pacman -Syu` on the phone tends to time out: the default mirror picks a server that can be far away, and pacman drops any download that stalls for ten seconds. Run this inside the chroot:

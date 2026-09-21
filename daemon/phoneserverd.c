@@ -6,7 +6,8 @@
  *     feeds; without it the phone resets about 100 s after the UI stops
  *   - renews the Wi-Fi DHCP lease (the framework normally does that), with its own tiny DHCP client
  *   - watches the connection to the router and, if it stays down, brings the Android UI back
- *   - writes a live status file and a log; a display module can plug in later (see display_update)
+ *   - writes a live status file and a log
+ *   - runs the on-screen display (display/) and toggles it with the power button
  *
  * It runs outside the chroot, as root, and is built statically (see Makefile and
  * scripts/pc/build-daemon.sh). Single-threaded: nothing in the main loop may block for long,
@@ -17,6 +18,7 @@
 #include <errno.h>
 #include <fcntl.h>
 #include <ifaddrs.h>
+#include <linux/input.h>
 #include <linux/watchdog.h>
 #include <net/if.h>
 #include <netinet/in.h>
@@ -36,7 +38,7 @@
 #include <time.h>
 #include <unistd.h>
 
-#define VERSION "0.1"
+#define VERSION "0.2"
 
 /* ---- tuning ------------------------------------------------------------------------------ */
 #define WDT_FEED_EVERY_S      5      /* how often to pet the watchdog */
@@ -51,6 +53,8 @@
 #define DHCP_MAX_RENEW_S      (6 * 3600)
 #define DHCP_NAKS_TO_RESTORE  3
 #define LOG_MAX_BYTES         (256 * 1024)
+#define DISP_BRIGHTNESS       120    /* of the panel's max (365 on the test phone) */
+#define DISP_TIMEOUT_S        600    /* the screen turns itself off after this long; 0 = never */
 
 /* ---- config and state -------------------------------------------------------------------- */
 struct cfg {
@@ -58,7 +62,11 @@ struct cfg {
     char iface[IFNAMSIZ];
     const char *wdt_dev;
     int use_wdt, use_dhcp, use_restore, foreground, once;
-} cfg = { "/data/adb/phoneserver", "wlan0", "/dev/watchdog1", 1, 1, 1, 0, 0 };
+    int use_display, disp_brightness, disp_timeout;
+    char disp_theme[16];
+    const char *backlight;
+} cfg = { "/data/adb/phoneserver", "wlan0", "/dev/watchdog1", 1, 1, 1, 0, 0,
+          1, DISP_BRIGHTNESS, DISP_TIMEOUT_S, "paper", "/sys/class/backlight/panel" };
 
 static volatile sig_atomic_t g_stop = 0, g_dump = 0;
 static int64_t t_start;
@@ -352,9 +360,7 @@ static void net_tick(void) {
     if (dh.naks >= DHCP_NAKS_TO_RESTORE) restore_ui("DHCP server keeps refusing our address");
 }
 
-/* ---- display: a plug-in point ------------------------------------------------------------ */
-/* Drawing on the screen needs Samsung's ION + decon ioctl path (see docs/how-it-works.md), which
- * isn't implemented yet. This is where a backend would draw the same lines the log summary uses. */
+/* ---- one-line summaries (for the log and --once) ------------------------------------------ */
 #define LINE 160
 static int format_lines(char lines[][LINE], int max) {
     int n = 0; struct status *s = &st;
@@ -369,11 +375,126 @@ static int format_lines(char lines[][LINE], int max) {
     if (n < max) snprintf(lines[n++], LINE, "ssh root:%s arch:%s  dhcp lease %llds", s->ssh_root ? "up" : "DOWN", s->ssh_arch ? "up" : "DOWN", (long long)(dh.last_ok_mono ? dh.lease_s - (mono() - dh.last_ok_mono) : 0));
     return n;
 }
-static void display_update(void) { /* no backend yet */ }
+
+/* ---- on-screen display -------------------------------------------------------------------- */
+/* The picture is drawn by a small Java program (display/, run with app_process) through SurfaceFlinger,
+ * which keeps running while the Android UI is off. We start it and stop it, and set the backlight.
+ * The power button toggles it: with system_server gone nothing else reads that key. The screen stays
+ * dark until the first press, and turns itself off again after cfg.disp_timeout seconds (OLED burn-in,
+ * battery). See docs/how-it-works.md and display/README.md. */
+#define MAX_KEYDEVS 8
+static struct {
+    int on;                   /* screen is meant to be lit */
+    pid_t pid;                /* the display program's process group, or -1 */
+    int64_t on_since, kill_at;
+    int keys[MAX_KEYDEVS], nkeys;
+    int64_t last_press_ms;
+} dp = { 0, -1, 0, 0, { 0 }, 0, 0 };
+
+static int64_t mono_ms(void) { struct timespec ts; clock_gettime(CLOCK_MONOTONIC, &ts); return (int64_t)ts.tv_sec * 1000 + ts.tv_nsec / 1000000; }
+
+static int disp_files_ok(void) {
+    char a[320], b[320];
+    snprintf(a, sizeof a, "%s/display/run.sh", cfg.dir); snprintf(b, sizeof b, "%s/display/status.jar", cfg.dir);
+    return access(a, R_OK) == 0 && access(b, R_OK) == 0;
+}
+
+static void set_backlight(int v) {
+    char path[300], val[16];
+    snprintf(path, sizeof path, "%s/brightness", cfg.backlight);
+    int fd = open(path, O_WRONLY | O_CLOEXEC); if (fd < 0) return;
+    int n = snprintf(val, sizeof val, "%d", v);
+    if (write(fd, val, (size_t)n) < 0) logmsg("WARN", "cannot set the backlight: %s", strerror(errno));
+    close(fd);
+}
+
+static int max_backlight(void) {
+    char path[300]; snprintf(path, sizeof path, "%s/max_brightness", cfg.backlight);
+    return (int)read_long(path, 255);
+}
+
+static void disp_on(void) {
+    if (dp.on || !cfg.use_display) return;
+    if (!disp_files_ok()) { logmsg("WARN", "no display files in %s/display (see display/README.md); nothing to show", cfg.dir); return; }
+    pid_t pid = fork();
+    if (pid < 0) { logmsg("ERROR", "display: fork failed: %s", strerror(errno)); return; }
+    if (pid == 0) {
+        char run[320], log[320];
+        snprintf(run, sizeof run, "%s/display/run.sh", cfg.dir); snprintf(log, sizeof log, "%s/display.log", cfg.dir);
+        setsid();
+        int nul = open("/dev/null", O_RDONLY); if (nul >= 0) dup2(nul, 0);
+        int lf = open(log, O_WRONLY | O_CREAT | O_TRUNC, 0644); if (lf >= 0) { dup2(lf, 1); dup2(lf, 2); }
+        setenv("NO_BACKLIGHT", "1", 1);            /* we own the backlight */
+        execl("/system/bin/sh", "sh", run, "--theme", cfg.disp_theme, "--interval", "5", (char *)NULL);
+        _exit(127);
+    }
+    int mx = max_backlight(), b = cfg.disp_brightness > mx ? mx : cfg.disp_brightness;
+    dp.pid = pid; dp.on = 1; dp.on_since = mono(); dp.kill_at = 0;
+    set_backlight(b);
+    logmsg("INFO", "display on (theme %s, brightness %d/%d, auto-off %d s)", cfg.disp_theme, b, mx, cfg.disp_timeout);
+}
+
+static void disp_off(int hard) {
+    if (!dp.on && dp.pid < 0) return;
+    set_backlight(0);
+    if (dp.pid > 0) { kill(-dp.pid, hard ? SIGKILL : SIGTERM); dp.kill_at = hard ? 0 : mono() + 3; if (hard) dp.pid = -1; }
+    if (dp.on) logmsg("INFO", "display off");
+    dp.on = 0;
+}
+
+static void disp_tick(void) {
+    if (dp.pid > 0 && dp.kill_at && mono() >= dp.kill_at) {          /* it ignored SIGTERM */
+        if (kill(dp.pid, 0) == 0) kill(-dp.pid, SIGKILL);
+        dp.pid = -1; dp.kill_at = 0;
+    }
+    if (!dp.on) return;
+    if (kill(dp.pid, 0) != 0) {                                        /* SIGCHLD is ignored, so a dead child is just gone */
+        logmsg("WARN", "the display program exited on its own (see display.log); screen off");
+        set_backlight(0); dp.on = 0; dp.pid = -1;
+    } else if (cfg.disp_timeout > 0 && mono() - dp.on_since >= cfg.disp_timeout) {
+        logmsg("INFO", "display auto-off after %d s", cfg.disp_timeout);
+        disp_off(0);
+    }
+}
+
+/* Find every input device that can send KEY_POWER (on the test phone: gpio_keys, event14). */
+static void input_open(void) {
+    for (int i = 0; i < 32 && dp.nkeys < MAX_KEYDEVS; i++) {
+        char path[40]; snprintf(path, sizeof path, "/dev/input/event%d", i);
+        int fd = open(path, O_RDONLY | O_NONBLOCK | O_CLOEXEC); if (fd < 0) continue;
+        unsigned char ev[EV_MAX / 8 + 1], key[KEY_MAX / 8 + 1]; memset(ev, 0, sizeof ev); memset(key, 0, sizeof key);
+        if (ioctl(fd, EVIOCGBIT(0, sizeof ev), ev) < 0 || !(ev[EV_KEY / 8] & (1 << (EV_KEY % 8))) ||
+            ioctl(fd, EVIOCGBIT(EV_KEY, sizeof key), key) < 0 || !(key[KEY_POWER / 8] & (1 << (KEY_POWER % 8)))) { close(fd); continue; }
+        char name[64] = "?"; if (ioctl(fd, EVIOCGNAME(sizeof name), name) < 0) snprintf(name, sizeof name, "?");
+        dp.keys[dp.nkeys++] = fd;
+        logmsg("INFO", "power button: %s (%s)", path, name);
+    }
+    if (!dp.nkeys) logmsg("WARN", "no input device with a power key found; the display can't be toggled");
+}
+
+static void input_read(void) {
+    struct input_event e[16];
+    for (int k = 0; k < dp.nkeys; k++) {
+        ssize_t n;
+        while ((n = read(dp.keys[k], e, sizeof e)) > 0) {
+            for (size_t j = 0; j < (size_t)n / sizeof e[0]; j++) {
+                if (e[j].type != EV_KEY || e[j].code != KEY_POWER || e[j].value != 1) continue;
+                int64_t now = mono_ms();
+                if (now - dp.last_press_ms < 400) continue;             /* bounce */
+                dp.last_press_ms = now;
+                logmsg("INFO", "power button pressed");
+                if (dp.on) disp_off(0); else disp_on();
+            }
+        }
+        if (n < 0 && errno != EAGAIN && errno != EINTR) {               /* device went away */
+            close(dp.keys[k]); dp.keys[k--] = dp.keys[--dp.nkeys];
+        }
+    }
+}
 
 /* ---- status file ------------------------------------------------------------------------- */
 static void write_status(void) {
-    char json[2048], tmp[300], path[300]; struct status *s = &st;
+    char json[2560], tmp[300], path[300]; struct status *s = &st;
     int64_t fed = wdt_fd >= 0 ? mono() - wdt_last_feed : -1;
     int64_t next = cfg.use_dhcp && dh.next_at > mono() ? dh.next_at - mono() : 0;
     char tempbuf[16];
@@ -387,6 +508,7 @@ static void write_status(void) {
         " \"dhcp\": {\"enabled\": %s, \"last_ok\": %lld, \"lease_s\": %lld, \"next_renewal_in_s\": %lld, \"server\": \"%s\", \"naks\": %d, \"failures\": %d},\n"
         " \"services\": {\"ssh_android_22\": %s, \"ssh_chroot_2222\": %s},\n"
         " \"watchdog\": {\"enabled\": %s, \"device\": \"%s\", \"open\": %s, \"fed_ago_s\": %lld},\n"
+        " \"display\": {\"available\": %s, \"on\": %s, \"auto_off_s\": %d, \"theme\": \"%s\"},\n"
         " \"restore_started\": %s\n}\n",
         (long long)s->wall, (long long)s->uptime_s, s->bat_pct, tempbuf, s->bat_state,
         s->mem_used_mb, s->mem_avail_mb, s->mem_total_mb,
@@ -394,6 +516,7 @@ static void write_status(void) {
         cfg.use_dhcp ? "true" : "false", (long long)dh.last_ok_wall, (long long)dh.lease_s, (long long)next, dh.server, dh.naks, dh.fails,
         s->ssh_root ? "true" : "false", s->ssh_arch ? "true" : "false",
         cfg.use_wdt ? "true" : "false", cfg.wdt_dev, wdt_fd >= 0 ? "true" : "false", (long long)fed,
+        cfg.use_display && disp_files_ok() ? "true" : "false", dp.on ? "true" : "false", cfg.disp_timeout, cfg.disp_theme,
         restore_started ? "true" : "false");
     snprintf(tmp, sizeof tmp, "%s/status.json.tmp", cfg.dir); snprintf(path, sizeof path, "%s/status.json", cfg.dir);
     FILE *f = fopen(tmp, "w"); if (!f) return; fputs(json, f); fclose(f); rename(tmp, path);
@@ -410,6 +533,11 @@ static void usage(void) {
          "  --no-watchdog    don't feed /dev/watchdog1      (for testing beside another feeder)\n"
          "  --no-dhcp        don't renew the DHCP lease\n"
          "  --no-restore     never bring the Android UI back automatically\n"
+         "  --no-display     don't manage the on-screen display or read the power button\n"
+         "  --display-theme NAME       paper or night (default paper)\n"
+         "  --display-brightness N     backlight level while the display is on (default 120)\n"
+         "  --display-timeout SECONDS  screen turns itself off after this long, 0 = never (default 600)\n"
+         "  --backlight DIR  backlight sysfs directory (default /sys/class/backlight/panel)\n"
          "  --foreground     also log to stderr\n"
          "  --once           collect status once, print it, and exit\n"
          "  --status         print the running daemon's status.json (and say if it looks stale)");
@@ -424,6 +552,11 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--no-watchdog")) cfg.use_wdt = 0;
         else if (!strcmp(argv[i], "--no-dhcp")) cfg.use_dhcp = 0;
         else if (!strcmp(argv[i], "--no-restore")) cfg.use_restore = 0;
+        else if (!strcmp(argv[i], "--no-display")) cfg.use_display = 0;
+        else if (!strcmp(argv[i], "--display-theme") && i + 1 < argc) snprintf(cfg.disp_theme, sizeof cfg.disp_theme, "%s", argv[++i]);
+        else if (!strcmp(argv[i], "--display-brightness") && i + 1 < argc) cfg.disp_brightness = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--display-timeout") && i + 1 < argc) cfg.disp_timeout = atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--backlight") && i + 1 < argc) cfg.backlight = argv[++i];
         else if (!strcmp(argv[i], "--foreground")) cfg.foreground = 1;
         else if (!strcmp(argv[i], "--once")) cfg.once = 1;
         else if (!strcmp(argv[i], "--status")) status_mode = 1;
@@ -431,6 +564,9 @@ int main(int argc, char **argv) {
         else { usage(); return !strcmp(argv[i], "--help") ? 0 : 2; }
     }
     if (!valid_iface(cfg.iface)) { fprintf(stderr, "bad interface name\n"); return 2; }
+    for (const char *c = cfg.disp_theme; *c; c++) if (*c < 'a' || *c > 'z') { fprintf(stderr, "bad theme name\n"); return 2; }
+    if (cfg.disp_brightness < 1) cfg.disp_brightness = 1;
+    if (cfg.disp_timeout < 0) cfg.disp_timeout = 0;
 
     if (status_mode) {
         char path[300], buf[4096]; snprintf(path, sizeof path, "%s/status.json", cfg.dir);
@@ -463,13 +599,14 @@ int main(int argc, char **argv) {
     t_start = mono(); dhcp_schedule(DHCP_FIRST_AFTER_S);
     logmsg("INFO", "phoneserverd " VERSION " started (iface %s, watchdog %s, dhcp %s)", cfg.iface, cfg.use_wdt ? cfg.wdt_dev : "off", cfg.use_dhcp ? "on" : "off");
     collect(); wdt_tick();
+    if (cfg.use_display) { input_open(); set_backlight(0); }
 
     int64_t last_stats = 0, last_summary = mono(); int stable_marked = 0;
     while (!g_stop) {
         wdt_tick();
         dhcp_tick();
         if (mono() - last_stats >= STATS_EVERY_S || g_dump) {
-            last_stats = mono(); g_dump = 0; collect(); net_tick(); write_status(); display_update();
+            last_stats = mono(); g_dump = 0; collect(); net_tick(); write_status();
         } else net_tick();
         if (mono() - last_summary >= SUMMARY_EVERY_S) {
             last_summary = mono(); char l[8][LINE]; int n = format_lines(l, 8); char all[640] = "";
@@ -480,8 +617,11 @@ int main(int argc, char **argv) {
             char p[300]; snprintf(p, sizeof p, "%s/headless.pending", cfg.dir); unlink(p); stable_marked = 1;
             logmsg("INFO", "stable for %d s, cleared the headless.pending marker", STABLE_AFTER_S);
         }
-        struct timespec ts = { 1, 0 }; nanosleep(&ts, NULL);
+        disp_tick();
+        struct pollfd pf[MAX_KEYDEVS]; int np = 0;                        /* sleep up to 1 s, but wake for the power button */
+        for (int i = 0; i < dp.nkeys; i++) { pf[np].fd = dp.keys[i]; pf[np].events = POLLIN; pf[np].revents = 0; np++; }
+        if (poll(pf, (nfds_t)np, 1000) > 0) input_read();
     }
-    logmsg("INFO", "stopping (signal)"); write_status(); wdt_release(); dhcp_close();
+    logmsg("INFO", "stopping (signal)"); disp_off(1); write_status(); wdt_release(); dhcp_close();
     unlink(lockp); return 0;
 }

@@ -62,7 +62,7 @@ scripts/pc/build-daemon.sh <ssh-host>                    # build the supervisor 
 ssh <phone-root> touch /data/adb/phoneserver/headless    # switch it on for the next boot
 ```
 
-On the next boot the phone waits until it's been up for 150 seconds and is on Wi-Fi, then stops the Android UI. The screen stays dark from then on.
+On the next boot the phone waits until it's been up for 150 seconds and is on Wi-Fi, then stops the Android UI. The screen goes dark. Press the power button and it shows a status ticket (battery, network, whether the watchdog is being fed); press again, or wait ten minutes, and it goes dark again. That part needs the display built and installed, see [display/](display/).
 
 Something has to replace the parts of Android that go away, so a small C program, `phoneserverd`, runs on the phone. It feeds the watchdog, renews the Wi-Fi DHCP lease, pings the router, and writes a status file and a log. If the router is unreachable for about five minutes it brings the UI back so Android can sort the network out itself. If two headless sessions in a row end early, headless mode turns itself off and the phone boots normally, so a bad build can't leave you with a screenless phone in a reset loop. More in [docs/daemon.md](docs/daemon.md).
 
@@ -82,7 +82,7 @@ Nothing here touches the Android system partition. Deleting `/data/adb/service.d
 - **Long runs.** The longest continuous headless run so far is well under an hour, plus a couple of unattended reboots. I haven't run it for days.
 - **Moving to another network** while headless works only through the fallback: after about five minutes without the router the Android UI comes back and you add the new Wi-Fi on the screen. I've watched it work once. There is no way to join a new Wi-Fi while headless.
 - **DHCP renewal** works against my router. Others may behave differently, and a DHCP reservation is still the safest setup.
-- **The screen stays dark.** There's a working status screen (a letterpress-style ticket, see [display/](display/)) that draws through SurfaceFlinger, but you start it by hand for now and the daemon doesn't manage it yet. My notes on how I got there are in [how-it-works.md](docs/how-it-works.md#drawing-on-the-screen).
+- **The status screen costs battery and RAM.** It's a Java program that uses about 100 MB while the screen is on, and lighting the panel obviously draws power. I haven't measured either properly. It only runs while the screen is on. How it works, and how I got there, is in [how-it-works.md](docs/how-it-works.md#drawing-on-the-screen).
 - **No systemd** in the chroot. The 4.x kernel is too old, so services are plain scripts.
 - **No `ping`** inside the chroot (no raw sockets). Everything else, `curl` included, works.
 - **Mirrors time out at random** on a phone connection. `setup-pacman.sh` copes, but expect the odd ten-second pause.

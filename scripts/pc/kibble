@@ -526,6 +526,10 @@ def panels(st, err, bw=14):
         [("MODE", "grey")],
         [mode, *flag],
     ]
+    disp = j.get("display")
+    if disp and disp.get("available"):
+        left += [[], [("SCREEN", "grey")],
+                 [("on" if disp["on"] else "off (power button)", "lime" if disp["on"] else "grey")]]
     ok = n["gateway_reachable"]
     age = fed_age(st)
     fed = age is not None and age <= FED_OK_S

@@ -17,6 +17,17 @@ for f in arch.sh ui.sh autostart.sh; do
     echo "installed $BASE/$f"
 done
 
+# the on-screen display (built by display/build.sh); skipped with a hint if it hasn't been built
+REPO="$(cd "$(dirname "$0")/../.." && pwd)"
+if [ -f "$REPO/display/build/status.jar" ]; then
+    ssh "$HOST" "mkdir -p $BASE/display"
+    ssh "$HOST" "cat > $BASE/display/status.jar" < "$REPO/display/build/status.jar"
+    ssh "$HOST" "cat > $BASE/display/run.sh && chmod 755 $BASE/display/run.sh" < "$REPO/display/run.sh"
+    echo "installed $BASE/display/{status.jar,run.sh}"
+else
+    echo "on-screen display not installed: run scripts/pc/get-display-tools.sh and display/build.sh, then this again"
+fi
+
 ssh "$HOST" "cat > /data/adb/service.d/phoneserver.sh && chmod 755 /data/adb/service.d/phoneserver.sh" < "$HERE/boot-hook.sh"
 echo "installed boot hook /data/adb/service.d/phoneserver.sh"
 

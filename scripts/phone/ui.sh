@@ -7,6 +7,11 @@
 #      If the phoneserverd binary isn't installed, a plain BusyBox watchdog feeder is used instead.
 # on:  stop the daemon (or the fallback feeder), then restart the framework. system_server opens the
 #      watchdog again by itself.
+#
+# Optional settings for the on-screen display go in /data/adb/phoneserver/display.conf (shell syntax):
+#   DISPLAY_THEME=paper       paper or night
+#   DISPLAY_BRIGHTNESS=120    backlight level while it is on (the panel's maximum is 365)
+#   DISPLAY_TIMEOUT=600       seconds until the screen turns itself off; 0 = stay on until the button is pressed
 BB=/data/adb/magisk/busybox
 D=/data/adb/phoneserver
 DAEMON=$D/phoneserverd
@@ -24,8 +29,15 @@ daemon_alive() {
 start_daemon() {
   daemon_alive && { echo "daemon already running (pid $(daemon_pid))"; return; }
   rm -f $STOPFILE
+  ARGS=""
+  if [ -f $D/display.conf ]; then
+    . $D/display.conf
+    [ -n "$DISPLAY_THEME" ] && ARGS="$ARGS --display-theme $DISPLAY_THEME"
+    [ -n "$DISPLAY_BRIGHTNESS" ] && ARGS="$ARGS --display-brightness $DISPLAY_BRIGHTNESS"
+    [ -n "$DISPLAY_TIMEOUT" ] && ARGS="$ARGS --display-timeout $DISPLAY_TIMEOUT"
+  fi
   # respawn loop: if the daemon ever crashes it is back within a second, well inside the watchdog window
-  $BB setsid $BB sh -c "while [ ! -f $STOPFILE ]; do $DAEMON >/dev/null 2>&1; [ -f $STOPFILE ] && break; sleep 1; done" >/dev/null 2>&1 &
+  $BB setsid $BB sh -c "while [ ! -f $STOPFILE ]; do $DAEMON $ARGS >/dev/null 2>&1; [ -f $STOPFILE ] && break; sleep 1; done" >/dev/null 2>&1 &
   echo $! > $SUPPID
   sleep 2
   echo "headless: daemon pid $(daemon_pid)"
@@ -61,6 +73,8 @@ case "$1" in
   on)
     rm -f $D/headless.pending      # a deliberate stop is not an unstable session (see autostart.sh)
     stop_daemon
+    # the status screen is a layer above everything; make sure none is left over Android's UI
+    for p in $($BB pgrep -f "dk\.Status"); do kill -9 $p 2>/dev/null; done
     if [ -f $FEEDPID ]; then kill "$(cat $FEEDPID)" 2>/dev/null; rm -f $FEEDPID; fi
     echo phoneserver > /sys/power/wake_unlock 2>/dev/null
     setprop ctl.start zygote; setprop ctl.start zygote_secondary

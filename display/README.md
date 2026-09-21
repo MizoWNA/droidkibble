@@ -12,14 +12,22 @@ The look is a letterpress ticket: a ruled grid on the body, a perforation, and a
 
 Checked on the Galaxy A30: it starts, both themes render correctly in a `screencap` of SurfaceFlinger's output, and it redraws every few seconds. An earlier plain-text version of the same approach was seen on the physical panel; the ticket page itself hasn't been looked at on the panel yet. It uses about 100 MB of RAM while running.
 
-Not done yet: `phoneserverd` doesn't start or stop it, so for now you run it by hand (below). I haven't measured its battery cost or run it for hours, and the panel brightness is fixed by `run.sh`.
+`phoneserverd` starts and stops it: the power button toggles the screen, it turns itself off after a timeout, and `ui.sh on` cleans it up. Checked on the phone with a real daemon: a (simulated) power press lights it, a second turns it off, the auto-off timer works, killing the program by hand makes the daemon turn the screen off, and `ui.sh on` with the screen lit leaves nothing behind. See [docs/daemon.md](../docs/daemon.md#the-screen-and-the-power-button). Not measured: battery cost, or a run of many hours.
 
-## Building and running
+## Installing
 
 ```sh
 scripts/pc/get-display-tools.sh      # once: JDK 17, d8 and android.jar into ~/.local/droidkibble-sdk (about 260 MB)
 display/build.sh                     # makes display/build/status.jar
+scripts/pc/install.sh <ssh-host>     # copies status.jar and run.sh to /data/adb/phoneserver/display/
+scripts/pc/build-daemon.sh <ssh-host>   # the daemon (0.2 or newer) is what reads the power button
+```
 
+Then go headless (`ui.sh off`) and press the power button. Settings (theme, brightness, timeout) are in `display.conf`; see [docs/daemon.md](../docs/daemon.md#the-screen-and-the-power-button).
+
+## Running it by hand
+
+```sh
 scp display/build/status.jar display/run.sh phone-root:/data/local/tmp/     # or anywhere next to each other
 ssh phone-root 'sh /data/local/tmp/run.sh --theme night --seconds 60'
 ```

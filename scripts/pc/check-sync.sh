@@ -23,6 +23,17 @@ check() {   # <repo-file> <path-on-phone>
 for f in arch.sh ui.sh autostart.sh; do check "$HERE/$f" "$BASE/$f"; done
 check "$HERE/boot-hook.sh" /data/adb/service.d/phoneserver.sh
 
+# the on-screen display
+REPO="$HERE/../.."
+[ -f "$REPO/display/run.sh" ] && check "$REPO/display/run.sh" "$BASE/display/run.sh"
+if [ -f "$REPO/display/build/status.jar" ]; then
+    want=$(sha256sum "$REPO/display/build/status.jar" | cut -d' ' -f1)
+    have=$(ssh -o BatchMode=yes -o ConnectTimeout=6 "$HOST" "/data/adb/magisk/busybox sha256sum $BASE/display/status.jar" 2>/dev/null | cut -d' ' -f1 || true)
+    if [ -z "$have" ]; then echo "MISSING  $BASE/display/status.jar   (run scripts/pc/install.sh $HOST)"; rc=1
+    elif [ "$have" = "$want" ]; then echo "same     $BASE/display/status.jar"
+    else echo "DIFFERS  $BASE/display/status.jar   (run scripts/pc/install.sh $HOST)"; rc=1; fi
+fi
+
 # the daemon binary: is the one on the phone built from the current source?
 if [ -f "$HERE/../../daemon/phoneserverd.c" ]; then
     want=$(sha256sum "$HERE/../../daemon/phoneserverd.c" | cut -d' ' -f1)

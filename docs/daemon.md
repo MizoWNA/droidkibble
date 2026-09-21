@@ -12,6 +12,7 @@ It's one static C binary (`daemon/phoneserverd.c`). It runs as root on the Andro
 | Renews the Wi-Fi DHCP lease | Android's framework normally renews it. Without that, the router eventually hands your address to another device. |
 | Pings the router every 10 seconds | If the router stays unreachable for 5 minutes, it brings the Android UI back so Android can reconnect on its own. |
 | Writes `status.json` and a log | So you can see what's going on over SSH. |
+| Runs the on-screen display and reads the power button | With the UI off the screen is dark. Pressing the power button lights it and shows the status ticket ([display/README.md](../display/README.md)); pressing again, or waiting for the auto-off timer, turns it off. |
 
 ## Installing it
 
@@ -36,7 +37,7 @@ ssh <phone-root> /data/adb/phoneserver/ui.sh status
 
 `status.json` is rewritten every 5 seconds. It has battery percentage, temperature and charging state, memory, the Wi-Fi address and gateway, whether the router answers, the DHCP lease (when it was last renewed, how long it lasts, when the next renewal is), whether both SSH servers are listening, and how long ago the watchdog was fed. `--status` warns if the file looks stale, which usually means the daemon isn't running.
 
-Options (all optional; the boot scripts use the defaults): `--dir`, `--iface`, `--no-watchdog`, `--no-dhcp`, `--no-restore`, `--foreground`, `--once`, `--status`.
+Options (all optional; the boot scripts use the defaults): `--dir`, `--iface`, `--no-watchdog`, `--no-dhcp`, `--no-restore`, `--no-display`, `--display-theme`, `--display-brightness`, `--display-timeout`, `--backlight`, `--foreground`, `--once`, `--status`. The display options are normally set through `display.conf` (below).
 
 ## How the DHCP renewal works
 
@@ -66,9 +67,29 @@ I've only tried this against my own router, which accepted the request and hande
 | `phoneserverd.log` (and `.1`) | log, rotated at 256 KB |
 | `phoneserverd.lock` | held while running; contains the pid; prevents a second copy |
 | `daemon.stop` | tells the respawn loop to stop restarting it |
+| `display/` | `status.jar` and `run.sh`, the on-screen display (installed by `install.sh`) |
+| `display.conf` | optional display settings, in shell syntax (see below) |
+| `display.log` | what the display program printed, for the current run |
 | `headless.pending` | exists from headless start until the session has been stable for 10 minutes |
 | `headless.blocked` | headless mode has been disabled after two unstable sessions |
 
-## Drawing on the screen
+## The screen and the power button
 
-Not wired in yet (see the prototype in `display/`). The daemon builds the same few status lines it logs (battery, memory, network, services) and hands them to an empty `display_update()`. Putting them on the panel needs Samsung's ION + display-driver path, described in [how-it-works.md](how-it-works.md#drawing-on-the-screen).
+With the Android UI off nothing reads the power button, so the daemon does. It looks through `/dev/input` for every device that can send a power key (on the Galaxy A30 that's `event14`, `gpio_keys`, which also carries the volume keys) and logs which one it found.
+
+- **The screen starts dark** when headless mode begins.
+- **One press** raises the backlight and starts the display program (`display/run.sh`, which draws through SurfaceFlinger). **Another press** kills the program and puts the backlight back to 0.
+- **It turns itself off** after 10 minutes (`DISPLAY_TIMEOUT`), to spare the OLED and the battery. Set it to 0 to keep the screen on until you press the button.
+- **If the display program dies**, the daemon notices, logs it, and turns the backlight off.
+- **If the display isn't installed** (no `display/status.jar`), the button does nothing and the log says so. `status.json` has a `display` block with `available`, `on`, `auto_off_s` and `theme`.
+- **Turning the Android UI back on** (`ui.sh on`, or the automatic restore) shuts the display down first, because its layer would otherwise sit on top of Android.
+
+To change the settings, create `/data/adb/phoneserver/display.conf`:
+
+```sh
+DISPLAY_THEME=night        # paper (default) or night
+DISPLAY_BRIGHTNESS=120     # backlight level while it's on; the panel's maximum is 365
+DISPLAY_TIMEOUT=600        # seconds until it turns itself off; 0 = stay on
+```
+
+It's read when headless mode starts (`ui.sh off`, or a boot), not while the daemon is running.
