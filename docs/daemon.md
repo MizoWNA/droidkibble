@@ -32,6 +32,8 @@ ssh <phone-root> tail /data/adb/phoneserver/phoneserverd.log   # times are UTC
 ssh <phone-root> /data/adb/phoneserver/ui.sh status
 ```
 
+`scripts/pc/kibble` shows the same information as a dashboard ([companion.md](companion.md)).
+
 `status.json` is rewritten every 5 seconds. It has battery percentage, temperature and charging state, memory, the Wi-Fi address and gateway, whether the router answers, the DHCP lease (when it was last renewed, how long it lasts, when the next renewal is), whether both SSH servers are listening, and how long ago the watchdog was fed. `--status` warns if the file looks stale, which usually means the daemon isn't running.
 
 Options (all optional; the boot scripts use the defaults): `--dir`, `--iface`, `--no-watchdog`, `--no-dhcp`, `--no-restore`, `--foreground`, `--once`, `--status`.

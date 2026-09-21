@@ -3,11 +3,24 @@
 Newest first. Each entry says what changed and, where it matters, why. Anything that isn't
 verified on real hardware is marked as such.
 
+## Unreleased (after 0.1.0)
+
+### Added
+- `scripts/pc/kibble`, a terminal dashboard (Python, standard library only). A pixel dog shows whether the watchdog is being fed, with battery, memory, network, DHCP and watchdog details around it. The bottom third is a persistent shell on the phone, either the Android root shell or the Arch chroot (Tab switches, each keeps its own directory). While a command runs, what you type goes to it, so prompts like pacman's `[Y/n]` can be answered. F5 and F6 switch headless mode on and off, now and at boot. See `docs/companion.md`.
+- kibble finds the phone on any network by its SSH host key, with a scan-and-login screen when it can't (`kibble`, `:connect`), plus `kibble learn`, `find` and `connect`. `kibble ssh-config --install` adds a `ProxyCommand` to `~/.ssh/config` so plain `ssh`, `scp` and `phonessh` follow the phone from network to network. Password login is written but untested.
+
+### Fixed
+- `scripts/phone/diagnose.sh` took minutes with the UI running (it started a `readlink` for every file descriptor of every process). It now uses one `ls` and takes about 2 seconds. I only found this by running it with the normal UI up; the headless run had been fast.
+
+### Verified on hardware (Galaxy A30)
+- Carrying the phone out of range of the router while headless: the daemon logged `network down` and, 5 min 8 s later, restored the Android UI (`router unreachable for too long`). The phone did not reset. Seen once.
+- Going headless on a second network (a cafe router on another subnet): the daemon found the new gateway and the router renewed the lease for 24 hours.
+- `diagnose.sh` with the UI running shows `system_server` holding `/dev/watchdog1` and `watchdogd` holding `/dev/watchdog`.
+- kibble: shells that keep their directory, answering `pacman -S` prompts from the chroot, Ctrl-C stopping commands and letting pacman release its lock, headless on and off from F5, and re-finding the phone after it changed address. Details and gaps are in `docs/companion.md`.
+
 ## 0.1.0 (first public version)
 
 ### Added
-- kibble can now find the phone on any network (by its SSH host key), with a scan-and-login screen when it can't (`kibble`, `:connect`), `kibble learn/find/connect`, and `kibble ssh-config --install` so plain `ssh`, `scp` and `phonessh` follow the phone. Also: Tab switches between the Android shell and the chroot, real cursor editing, `clear`/Ctrl-L, F5/F6 to switch headless on/off (now and at boot), and the watchdog age now counts up between updates instead of always reading 0. Password login is written but untested. Details in `docs/companion.md`.
-- `scripts/pc/kibble`: an arcade-style terminal dashboard (Python, standard library only). A pixel dog in the middle shows whether the watchdog is being fed, with battery and memory on its left and network, DHCP and watchdog on its right. The bottom third is a persistent shell on the phone (Android shell, or `@arch` for the chroot, each keeping its own directory). See `docs/companion.md`. Tested on Linux against the Galaxy A30 in headless mode through a pseudo-terminal; the look on real terminals, the other dog moods, and macOS are untested.
 - Project name is now droidkibble (was the working title phone-server). The on-phone paths (`/data/adb/phoneserver/`) are unchanged.
 - Issue templates in `.github/ISSUE_TEMPLATE/`: a device report and a bug form, both asking for `diagnose.sh` output.
 - `LICENSE` (MIT).
@@ -34,14 +47,11 @@ verified on real hardware is marked as such.
   `docs/how-it-works.md`. Not implemented yet.
 
 ### Changed
-- `scripts/phone/diagnose.sh` no longer takes minutes with the UI on: it forked `readlink` for every file descriptor of every process. It now uses a single `ls` (about 2 s on the test phone). Found by running it with the normal UI up; the headless run had been fast.
 - README and docs reworded to read less like a spec sheet. README is now written in the first person and lists what doesn't work up front.
 - `scripts/phone/arch.sh` now bind-mounts the chroot onto itself with `suid` and `dev` enabled.
   `/data` is mounted `nosuid` on Android, which broke `sudo` for non-root users.
 
 ### Verified on hardware (Galaxy A30, Android 11, kernel 4.4)
-- Going headless on a second network (a cafe router, 192.168.3.x): the daemon picked up the new gateway and the router renewed the lease (86400 s). `diagnose.sh` with the UI running shows `system_server` holding `/dev/watchdog1` and `watchdogd` holding `/dev/watchdog`, matching the write-up.
-- Leaving the router's range while headless: the daemon logged `network down`, and 5 min 8 s later restored the Android UI (`restoring the Android UI: router unreachable for too long`), released the watchdog and stopped. The phone did not reset, stayed up, and Android was usable on a different network afterwards. Seen once, on one phone.
 - `scripts/pc/install.sh` deployed to the phone, then a reboot: the chroot, its sshd and
   headless mode all came back from the installed paths.
 - `setup-pacman.sh` (run twice) and `setup-aur.sh` (run on an already configured chroot, so it
@@ -55,7 +65,7 @@ verified on real hardware is marked as such.
   script was re-run over the result).
 - Anything over several days: uptime, DHCP lease renewal while headless, Wi-Fi drops.
 
-## 0.1.0: first commit
+### What the very first version did
 - Arch Linux ARM chroot with key-only SSH and a Magisk `service.d` boot hook.
 - Optional headless mode: stops the Android UI and feeds `/dev/watchdog1` itself. Without that,
   the phone resets about 100 seconds after the UI stops. See `docs/how-it-works.md`.

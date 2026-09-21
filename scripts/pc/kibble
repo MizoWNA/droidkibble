@@ -22,14 +22,16 @@ Keys in the dashboard:
     Tab or Ctrl-T    switch between the two shells (each keeps its own directory)
     Left/Right/Home/End/Delete, Ctrl-A/E/W/K/U   edit the line
     Up / Down        command history          PgUp / PgDn   scroll the output
+    While a command runs, what you type goes to it (answer a pacman [Y/n] prompt, for instance)
     Ctrl-L or `clear`  clear the output
     F5  or :headless   turn headless mode on/off right now (asks first)
     F6  or :boot       turn "go headless at boot" on/off (asks first)
     :connect           pick a different phone / log in again        :help   list these
-    :q or Ctrl-D       quit                     Ctrl-C   stop a running command, or quit when idle
+    :q or Ctrl-D       quit                     Ctrl-C   ask a running command to stop, or quit when idle
 Programs that need a terminal (top, vim, ...) don't work here; use ssh for those.
 """
 import argparse
+import codecs
 import collections
 import concurrent.futures
 import curses
@@ -53,9 +55,10 @@ POLL = (
     f'echo ---once; $D/phoneserverd --once 2>/dev/null'
 )
 DONE = "__KB_DONE__"
+INIT = "__KB_INIT__"
+ANSI = re.compile(r"\x1b\[[0-9;?]*[A-Za-z]")
 FED_OK_S = 15          # the daemon feeds every 5 s; slower than this looks wrong
 STALE_S = 20           # status.json older than this is not from a running daemon
-CMD_TIMEOUT_S = 120
 CONF = os.path.expanduser("~/.config/droidkibble/phone.json")
 CACHE = os.path.expanduser("~/.cache/droidkibble")
 SSH_CONFIG = os.path.expanduser("~/.ssh/config")
@@ -369,48 +372,106 @@ CAPTION = {"fed": ("* GOOD BOY *", "lime"), "hungry": ("! FEED ME !", "yellow"),
 
 
 class Shell:
-    """A long-lived shell over ssh, so cd and variables carry from one command to the next."""
+    """A long-lived shell over ssh, so cd and variables carry from one command to the next.
 
-    def __init__(self, app, name, remote):
+    A running command reads its input from a FIFO (fd 3) fed over a second ssh, which is how
+    answers like the `y` for pacman's "Proceed? [Y/n]" reach it. The shell's own stdin stays
+    reserved for the shell's script."""
+
+    def __init__(self, app, name, remote, fifo_in_shell, fifo_on_host):
         self.app, self.name, self.remote = app, name, remote
-        self.cwd, self.proc = "~", None
+        self.fifo, self.fifo_host = fifo_in_shell, fifo_on_host
+        self.cwd, self.proc, self.pid, self.feeder = "~", None, None, None
 
     def start(self):
         self.proc = subprocess.Popen(ssh_argv(self.remote), stdin=subprocess.PIPE, stdout=subprocess.PIPE,
-                                     stderr=subprocess.STDOUT, text=True, errors="replace", bufsize=1,
-                                     env=child_env())
+                                     stderr=subprocess.STDOUT, bufsize=0, env=child_env())
+        self.pid = None
         threading.Thread(target=self.reader, args=(self.proc,), daemon=True).start()
+        f = self.fifo
+        # trap INT so the shell survives when Ctrl-C kills a command (children still get the default action)
+        self.write(f'trap : INT; rm -f {f}; mkfifo {f} 2>/dev/null && exec 3<>{f} || exec 3</dev/null; echo "{INIT} $$"\n')
+
+    def write(self, text):
+        self.proc.stdin.write(text.encode())
+        self.proc.stdin.flush()
 
     def kill(self):
-        if self.proc and self.proc.poll() is None:
-            self.proc.kill()
-        self.proc = None
+        for pr in (self.proc, self.feeder):
+            if pr and pr.poll() is None:
+                pr.kill()
+        self.proc = self.feeder = self.pid = None
 
     def run(self, line):
         if not self.proc or self.proc.poll() is not None:
             self.start()
-        # stdin from /dev/null so a command can't swallow the lines meant for the shell
-        self.proc.stdin.write(f'{{ {line}\n}} </dev/null 2>&1; echo "{DONE} $? $PWD"\n')
-        self.proc.stdin.flush()
+        self.write(f'{{ {line}\n}} <&3 2>&1; echo "{DONE} $? $PWD"\n')
+
+    def send_input(self, text):
+        if not self.feeder or self.feeder.poll() is not None:
+            self.feeder = subprocess.Popen(ssh_argv(f"cat > {self.fifo_host}"), stdin=subprocess.PIPE,
+                                           stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL, env=child_env())
+        self.feeder.stdin.write((text + "\n").encode())
+        self.feeder.stdin.flush()
+
+    def interrupt(self, token):
+        """Stop the running command the way Ctrl-C would: SIGINT first (pacman, for one, only cleans up
+        its lock on SIGINT), then SIGTERM. The shell survives. If the command ignores both, give up on
+        the whole session."""
+        if not self.pid:
+            self.app.stop_running("no shell pid known")
+            return
+
+        def signal_children(sig):
+            # toybox pkill can't select by parent without a name, so walk ps
+            cmd = (f'ps -A -o PID,PPID | while read p pp; do [ "$pp" = "{self.pid}" ] && kill -{sig} $p; done')
+            subprocess.run(ssh_argv(cmd, 15), capture_output=True, env=child_env(), stdin=subprocess.DEVNULL)
+
+        def work():
+            for sig, wait in (("INT", 6), ("TERM", 6)):
+                signal_children(sig)
+                time.sleep(wait)
+                if not (self.app.active is self and self.app.busy_since == token):
+                    return
+            self.app.stop_running("the command ignored the stop requests")
+        threading.Thread(target=work, daemon=True).start()
 
     def reader(self, proc):
-        for raw in proc.stdout:
-            line = raw.rstrip("\n").replace("\t", "    ")
-            i = line.find(DONE)
-            if i < 0:
-                self.app.add(line)
-                continue
-            if line[:i]:
-                self.app.add(line[:i])
-            rc, _, cwd = line[i + len(DONE):].strip().partition(" ")
-            self.cwd = cwd or self.cwd
-            if rc not in ("0", ""):
-                self.app.add(f"[exit {rc}]")
-            self.app.finish(self)
+        dec = codecs.getincrementaldecoder("utf-8")("replace")
+        fd, pend = proc.stdout.fileno(), ""
+        while True:
+            try:
+                chunk = os.read(fd, 65536)
+            except OSError:
+                break
+            if not chunk:
+                break
+            pend += dec.decode(chunk).replace("\t", "    ")
+            while "\n" in pend:
+                line, pend = pend.split("\n", 1)
+                self.line(ANSI.sub("", line.split("\r")[-1]))
+            self.app.set_partial(self, ANSI.sub("", pend.split("\r")[-1]))    # a prompt waiting for input
         if proc is self.proc:                    # the shell itself ended (e.g. `exit`)
             self.proc = None
             self.app.add(f"[{self.name} shell closed; the next command starts a new one]")
             self.app.finish(self)
+
+    def line(self, line):
+        i = line.find(INIT)
+        if i >= 0:
+            self.pid = line[i + len(INIT):].strip() or None
+            return
+        i = line.find(DONE)
+        if i < 0:
+            self.app.add(line)
+            return
+        if line[:i]:
+            self.app.add(line[:i])
+        rc, _, cwd = line[i + len(DONE):].strip().partition(" ")
+        self.cwd = cwd or self.cwd
+        if rc not in ("0", ""):
+            self.app.add(f"[exit {rc}]")
+        self.app.finish(self)
 
 
 # ---------------------------------------------------------------- what to show
@@ -621,7 +682,8 @@ def put(scr, y, x, s, attr=0):
 HELP = [
     "Enter runs the line.   Tab / Ctrl-T switches between the Android shell and the Arch chroot.",
     "Left/Right/Home/End/Delete and Ctrl-A/E/W/K/U edit the line.  Up/Down = history.  PgUp/PgDn scroll.",
-    "Ctrl-L or `clear` clears this pane.   Ctrl-C stops a running command (or quits when idle).",
+    "While a command runs, type to answer it (e.g. y for pacman).  Ctrl-C asks it to stop (or quits when idle).",
+    "Ctrl-L or `clear` clears this pane.",
     "F5 / :headless  headless on/off now.   F6 / :boot  go headless at boot on/off.   :connect  change phone.",
     ":q or Ctrl-D quits.",
 ]
@@ -836,6 +898,7 @@ class App:
         self.lock = threading.Lock()
         self.active = None                       # the Shell running a command right now
         self.busy_since = 0.0
+        self.partial = ""                        # output so far without a newline, e.g. a prompt
         self.quit = False
         self.want_connect = False
         self.confirm = None                      # (question, function) waiting for y/n
@@ -846,8 +909,9 @@ class App:
     def reset_shells(self):
         for sh in getattr(self, "shells", {}).values():
             sh.kill()
-        self.shells = {"android": Shell(self, "android", "sh"),
-                       "arch": Shell(self, "arch", f"{BASE}/arch.sh run sh")}
+        self.shells = {"android": Shell(self, "android", "sh", "/data/local/tmp/kibble-in", "/data/local/tmp/kibble-in"),
+                       "arch": Shell(self, "arch", f"{BASE}/arch.sh run sh", "/root/.kibble-in",
+                                     "/data/arch/root/.kibble-in")}
         self.current = "android"
         self.active = None
 
@@ -874,10 +938,16 @@ class App:
         with self.lock:
             self.out.append(line)
 
+    def set_partial(self, shell, text):
+        with self.lock:
+            if self.active is shell:
+                self.partial = text
+
     def finish(self, shell):
         with self.lock:
             if self.active is shell:
                 self.active = None
+                self.partial = ""
         self.wake.set()
 
     def submit(self, line):
@@ -888,8 +958,15 @@ class App:
             return
         if line.startswith(":"):
             return self.colon(line[1:].strip())
-        if self.active:
-            self.add("[still running; Ctrl-C stops it]")
+        if self.active:                          # something is running: this is its input
+            sh = self.active
+            with self.lock:
+                self.out.append(self.partial + line)
+                self.partial = ""
+            try:
+                sh.send_input(line)
+            except (OSError, ValueError) as e:
+                self.add(f"[could not send input: {e}]")
             return
         name = "arch" if line.startswith("@arch ") else self.current
         shell = self.shells[name]
@@ -900,7 +977,7 @@ class App:
             return
         self.add(f"{shell.name}:{shell.cwd}$ {cmd}")
         with self.lock:
-            self.active, self.busy_since = shell, time.time()
+            self.active, self.busy_since, self.partial = shell, time.time(), ""
         try:
             shell.run(cmd)
         except (OSError, ValueError) as e:
@@ -927,7 +1004,8 @@ class App:
             sh, self.active = self.active, None
         if sh:
             sh.kill()
-            self.add(f"[{why}; the {sh.name} shell was dropped and starts fresh next time]")
+            self.add(f"[{why}; the {sh.name} shell was dropped and starts fresh next time. "
+                     f"The command may still be running on the phone.]")
 
     # -- headless controls
     def toggle_headless(self):
@@ -997,6 +1075,7 @@ class App:
             return
         with self.lock:
             st, err, out, active = self.state, self.err, list(self.out), self.active
+            partial = self.partial if self.active else ""
         m = mood(st, err)
         color256 = curses.COLORS >= 256
         j = fresh_json(st)
@@ -1069,11 +1148,16 @@ class App:
         title = f" TERMINAL  {shell.name}:{shell.cwd} "
         P(sep, 0, "━" * w, col("orange"))
         P(sep, 2, title[:w - 4], col("orange") | curses.A_BOLD)
-        hint = " running... Ctrl-C stops " if active else " Tab shell · F5 headless · F6 boot · :help "
+        hint = " running: type to answer it, Ctrl-C stops " if active else " Tab shell · F5 headless · F6 boot · :help "
         P(sep, max(len(title) + 4, w - len(hint) - 2), hint, col("yellow" if active else "grey") | (curses.A_BOLD if active else 0))
         room = term_h - 1
+        if partial:
+            out.append("\0" + partial)             # marks a live prompt line
         end = len(out) - self.scroll
         for i, l in enumerate(out[max(0, end - room):end]):
+            if l.startswith("\0"):
+                P(sep + 1 + i, 1, l[1:], col("yellow") | curses.A_BOLD)
+                continue
             first = l.split(" ", 1)[0]
             attr = col("cyan") if first.endswith("$") else col("red") if l.startswith("[") else 0
             P(sep + 1 + i, 1, l, attr)
@@ -1084,10 +1168,10 @@ class App:
             except curses.error:
                 pass
         else:
-            prompt = f"{shell.name}> "
+            prompt = "answer> " if active else f"{shell.name}> "
             avail = max(5, w - len(prompt) - 2)
             off = max(0, self.cur - avail + 1)
-            P(h - 1, 0, prompt, col("orange") | curses.A_BOLD)
+            P(h - 1, 0, prompt, col("yellow" if active else "orange") | curses.A_BOLD)
             P(h - 1, len(prompt), self.buf[off:off + avail], curses.A_BOLD)
             try:
                 scr.move(h - 1, min(w - 2, len(prompt) + self.cur - off))
@@ -1109,7 +1193,8 @@ class App:
             self.quit = True
         elif ch == "\x03":
             if self.active:
-                self.stop_running("stopped")
+                self.add("[Ctrl-C: asking the command to stop]")
+                self.active.interrupt(self.busy_since)
             else:
                 self.quit = True
         elif ch in ("\n", "\r"):
@@ -1170,8 +1255,6 @@ class App:
         scr.timeout(250)
         threading.Thread(target=self.poller, daemon=True).start()
         while not self.quit:
-            if self.active and time.time() - self.busy_since > CMD_TIMEOUT_S:
-                self.stop_running(f"no answer after {CMD_TIMEOUT_S} s")
             if self.want_connect:
                 self.want_connect = False
                 t = connect_screen(scr)

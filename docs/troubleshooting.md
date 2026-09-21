@@ -8,6 +8,8 @@
 | `ssh phone-root` times out after a reboot | Boot takes a minute or two on old phones. Wait, then check it's reachable with `ping`. |
 | `ssh phone-root` works, `ssh arch` doesn't | The chroot's SSH server isn't running. Look at `/data/adb/phoneserver/boot.log` on the phone, and try `/data/adb/phoneserver/arch.sh run "pgrep -a sshd"`. |
 | Everything inside the chroot fails with DNS errors | `/etc/resolv.conf` in the chroot is broken. `arch.sh` rewrites it each time it mounts; run `arch.sh run true` once. |
+| `pacman` says "unable to lock database" | A pacman that was killed hard left `/var/lib/pacman/db.lck` behind. Check that nothing is still running (`ps -A \| grep pacman` on the phone), then delete the file and run `pacman -Dk` to check the database. In kibble, Ctrl-C interrupts pacman properly and it releases the lock itself. |
+| `pacman` in kibble seems to hang after printing its packages | It's waiting for your answer to `Proceed with installation? [Y/n]`. Type `y` and Enter. (Older versions of kibble hid that prompt.) |
 | `pacman` says "failed to retrieve" or times out | A mirror is slow. Comment out repos you don't need in `/etc/pacman.conf`. Also make sure `DisableSandbox` is set. |
 | `pacman -Syu` fails with "Operation too slow" | Run `setup-pacman.sh` (see setup step 7): it picks fast mirrors and disables the stall timeout. |
 | Everything works as root but a normal user says "could not resolve host" | The user isn't in group 3003. See the quirks table in [how-it-works.md](how-it-works.md). |
@@ -22,4 +24,5 @@
 | `phoneserverd --status` says the status is stale or missing | The daemon isn't running. `ui.sh status` shows it; `ui.sh off` starts it. Check that the binary exists (`scripts/pc/check-sync.sh`). |
 | Screen is dark and you want the normal phone back | `ssh phone-root /data/adb/phoneserver/ui.sh on`. Then `rm /data/adb/phoneserver/headless` so it doesn't happen again next boot. |
 | The phone is somewhere new and you can't get in over Wi-Fi | While headless it can't join a new network. If the daemon is running, the Android UI comes back about five minutes after the router disappears; then add the Wi-Fi on the screen, or over a USB cable: `adb shell su -c '/data/adb/phoneserver/ui.sh on'`, then on Android 11 `adb shell cmd wifi connect-network <ssid> wpa2 <password>` (I haven't tried that command on this phone). Once you can SSH in, `ui.sh off` goes headless again without a reboot. |
+| `kibble` can't find the phone | Run `kibble` with no arguments and follow the scan screen, or use `kibble learn <ssh-host>` while it's reachable. See [companion.md](companion.md#finding-the-phone). |
 | You can't reach the phone at all | Plug in the cable. `adb` over USB works even when Wi-Fi doesn't. Failing that, hold power and volume-down for about ten seconds to force a reboot. |

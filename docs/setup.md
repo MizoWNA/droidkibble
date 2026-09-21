@@ -136,6 +136,10 @@ Two notes. Many AUR packages only list `x86_64` in their PKGBUILD; if a build re
 - `/etc/resolv.conf` is rewritten by `arch.sh` every time it mounts the chroot.
 - Non-root users need to be in a group with gid 3003 to reach the network. See the table in [how-it-works.md](how-it-works.md#android-quirks-that-show-up-inside-the-chroot).
 
+## Optional: the dashboard
+
+`scripts/pc/kibble` is a terminal dashboard for the phone, with a shell and a headless switch, and it can find the phone again after you change networks. It needs nothing beyond Python 3. If you move the phone between networks, run `scripts/pc/kibble ssh-config --install` once so plain `ssh` follows it. See [companion.md](companion.md).
+
 ## Optional: a matching shell
 
 If you use zsh with oh-my-zsh, [extras/phonessh](../extras/README.md) gives you a shell on the phone that looks like your own terminal, in shifted colors so you can tell them apart.

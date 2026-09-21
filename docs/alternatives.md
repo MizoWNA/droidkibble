@@ -1,6 +1,6 @@
 # Alternatives and prior art
 
-A quick survey of what already exists for turning an old phone into a server, and where this project overlaps or differs. It was done with web searches and by reading each project's README (September 2026), so treat it as a starting point, not a full review. If something here is wrong or out of date, please say so.
+Before publishing this I looked at what already exists for turning an old phone into a server, to see where this overlaps and where it doesn't. It's based on web searches and reading each project's README in September 2026, so it's a starting point and not a proper review. If something here is wrong or out of date, please tell me.
 
 ## What's out there
 
@@ -14,7 +14,7 @@ A quick survey of what already exists for turning an old phone into a server, an
 
 - **It stops the Android framework and keeps the phone stable.** Most others don't try. On the test phone that needs feeding a second hardware watchdog (`/dev/watchdog1`) that Samsung's `system_server` normally feeds. I didn't find that documented elsewhere, though absence from search results isn't proof. The general method (list which processes hold `/dev/watchdog*` and reproduce what they do) should apply to other phones, but the specific device is Samsung- and kernel-dependent.
 - **A supervisor for the headless state.** `phoneserverd` feeds the watchdog, renews the DHCP lease with its own client (BusyBox `udhcpc` is blocked by Android's SELinux policy), checks the router, restores the UI if the network stays down, and has a boot-loop breaker.
-- **The write-up.** A consolidated list of the Android-specific traps hit along the way (`nosuid` on `/data`, the network group for non-root users, `fakeroot` without System V IPC, mirror timeouts) and what didn't work.
+- **The write-up.** One place listing the Android-specific traps I hit along the way (`nosuid` on `/data`, the network group for non-root users, `fakeroot` without System V IPC, mirror timeouts) and what didn't work.
 
 ## Where it doesn't
 
