@@ -1,0 +1,41 @@
+name: I tried it on my phone
+description: Tell me how it went, whether it worked or not. This is the most useful thing you can send.
+title: "[report] <brand model>: "
+labels: ["device-report"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for trying it. So far this has only been run on a Galaxy A30, so every report on another phone helps.
+  - type: textarea
+    id: diagnose
+    attributes:
+      label: Output of diagnose.sh
+      description: |
+        Run `ssh <phone-root> sh -s < scripts/phone/diagnose.sh`, or the adb version in docs/setup.md step 0.
+        It's read-only and prints no IP addresses or serial numbers. Ideally run it once with the normal UI on.
+      render: text
+    validations:
+      required: true
+  - type: dropdown
+    id: how-far
+    attributes:
+      label: How far did you get?
+      options:
+        - Only ran diagnose.sh
+        - Chroot and SSH work
+        - Headless mode works
+        - Headless mode ran, then something went wrong
+        - Got stuck before the chroot worked
+    validations:
+      required: true
+  - type: input
+    id: uptime
+    attributes:
+      label: Longest headless run (if you did one)
+      placeholder: e.g. 2 days
+  - type: textarea
+    id: notes
+    attributes:
+      label: Anything else
+      description: Which watchdog device your phone needed feeding, what you changed, what surprised you.

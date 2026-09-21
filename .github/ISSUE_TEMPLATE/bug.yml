@@ -1,0 +1,34 @@
+name: Something broke
+description: A script failed, the phone rebooted, or headless mode misbehaved.
+labels: ["bug"]
+body:
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened, and what did you expect?
+    validations:
+      required: true
+  - type: textarea
+    id: steps
+    attributes:
+      label: What you ran
+      description: The commands, in order. Say which step of docs/setup.md you were on.
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: diagnose
+    attributes:
+      label: Output of diagnose.sh
+      description: "`ssh <phone-root> sh -s < scripts/phone/diagnose.sh`"
+      render: text
+    validations:
+      required: true
+  - type: textarea
+    id: logs
+    attributes:
+      label: Logs
+      description: |
+        For headless problems: `tail -50 /data/adb/phoneserver/phoneserverd.log` and `/data/adb/phoneserver/boot.log`,
+        plus `phoneserverd --status`. If the phone rebooted, say how long after going headless.
+      render: text
