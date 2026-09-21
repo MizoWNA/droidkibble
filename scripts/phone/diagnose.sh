@@ -36,29 +36,30 @@ fi
 
 echo
 echo "who has them open (needs root):"
+# One ls for every process: forking readlink per fd takes minutes when the UI is up.
+found=$(ls -l /proc/[0-9]*/fd 2>/dev/null | while read -r line; do
+    case "$line" in
+    /proc/*/fd:) pid=${line#/proc/}; pid=${pid%%/*} ;;
+    *"-> /dev/watchdog"*) echo "/dev/${line##*/dev/} $pid" ;;
+    esac
+done)
 held=""
-for p in /proc/[0-9]*; do
-    pid=${p#/proc/}
-    for fd in "$p"/fd/*; do
-        t=$(readlink "$fd" 2>/dev/null) || continue
-        case "$t" in
-        /dev/watchdog*)
-            name=$(tr '\0' ' ' < "$p/cmdline" 2>/dev/null | cut -c1-60)
-            [ -n "$name" ] || name=$(cat "$p/comm" 2>/dev/null)
-            echo "  $t  <-  pid $pid  $name"
-            held="$held $t:$name"
-            ;;
-        esac
-    done
+sysheld=""
+IFS='
+'
+for l in $found; do
+    dev=${l% *}; pid=${l##* }
+    name=$(tr '\0' ' ' < "/proc/$pid/cmdline" 2>/dev/null | cut -c1-60)
+    [ -n "$name" ] || name=$(cat "/proc/$pid/comm" 2>/dev/null)
+    echo "  $dev  <-  pid $pid  $name"
+    held="$held $dev"
+    case "$name" in *system_server*) sysheld="$sysheld $dev" ;; esac
 done
+unset IFS
 [ -n "$held" ] || echo "  (nobody, or not root)"
 
 echo
 echo "== what this means"
-sysheld=""
-for h in $held; do
-    case "$h" in *system_server*) sysheld="$sysheld ${h%%:*}" ;; esac
-done
 if [ -n "$sysheld" ]; then
     echo "system_server holds:$sysheld"
     echo "If you stop the Android framework, nothing feeds those devices and the phone will"

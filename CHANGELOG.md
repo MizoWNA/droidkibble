@@ -32,6 +32,7 @@ verified on real hardware is marked as such.
   `docs/how-it-works.md`. Not implemented yet.
 
 ### Changed
+- `scripts/phone/diagnose.sh` no longer takes minutes with the UI on: it forked `readlink` for every file descriptor of every process. It now uses a single `ls` (about 2 s on the test phone). Found by running it with the normal UI up; the headless run had been fast.
 - README and docs reworded to read less like a spec sheet. README is now written in the first person and lists what doesn't work up front.
 - `scripts/phone/arch.sh` now bind-mounts the chroot onto itself with `suid` and `dev` enabled.
   `/data` is mounted `nosuid` on Android, which broke `sudo` for non-root users.
